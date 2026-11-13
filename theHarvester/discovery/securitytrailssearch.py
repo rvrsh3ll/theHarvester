@@ -1,57 +1,110 @@
-from theHarvester.discovery.constants import *
-from theHarvester.lib.core import *
-from theHarvester.parsers import securitytrailsparser
-import asyncio
+from __future__ import annotations
+
+from ipaddress import ip_address
+from typing import Any
+
+from theHarvester.discovery.constants import MissingKey
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, Core, FetcherResponse
+from theHarvester.lib.hostnames import normalize_scoped_hostname
+from theHarvester.lib.source_execution import SourceExecutionReport
 
 
 class SearchSecuritytrail:
-
-    def __init__(self, word):
+    def __init__(self, word: str) -> None:
         self.word = word
         self.key = Core.security_trails_key()
-        if self.key is None:
+        if not isinstance(self.key, str) or not self.key.strip():
             raise MissingKey('Securitytrail')
-        self.results = ""
-        self.totalresults = ""
         self.api = 'https://api.securitytrails.com/v1/'
-        self.info = ()
+        self.info: tuple[set[str], set[str]] = (set(), set())
         self.proxy = False
+        self.domain_data: dict[str, Any] = {}
+        self.subdomains_data: dict[str, Any] = {}
+        self._report: SourceExecutionReport | None = None
 
-    async def authenticate(self) -> None:
-        # Method to authenticate API key before sending requests.
-        headers = {'APIKEY': self.key}
-        url = f'{self.api}ping'
-        auth_responses = await AsyncFetcher.fetch_all([url], headers=headers, proxy=self.proxy)
-        auth_responses = auth_responses[0]
-        if 'False' in auth_responses or 'Invalid authentication' in auth_responses:
-            print('\tKey could not be authenticated exiting program.')
-        await asyncio.sleep(2)
+    def _body(self, response: Any) -> dict[str, Any] | None:
+        if error := provider_http_error(response):
+            self._report = SourceExecutionReport(*error)
+            return None
+        assert isinstance(response, FetcherResponse)
+        if not isinstance(response.body, dict):
+            self._report = SourceExecutionReport('failed', 'invalid-response')
+            return None
+        return response.body
 
-    async def do_search(self) -> None:
-        # https://api.securitytrails.com/v1/domain/domain.com
-        url = f'{self.api}domain/{self.word}'
-        headers = {'APIKEY': self.key}
-        response = await AsyncFetcher.fetch_all([url], headers=headers, proxy=self.proxy)
-        await asyncio.sleep(2)  # Not random delay because 2 seconds is required due to rate limit.
-        self.results = response[0]
-        self.totalresults += self.results
-        url += '/subdomains'  # Get subdomains now.
-        subdomain_response = await AsyncFetcher.fetch_all([url], headers=headers, proxy=self.proxy)
-        await asyncio.sleep(2)
-        self.results = subdomain_response[0]
-        self.totalresults += self.results
+    def _parse_domain(self, data: dict[str, Any]) -> bool:
+        malformed = False
+        current_dns = data.get('current_dns', {})
+        if not isinstance(current_dns, dict):
+            return True
+        ips = self.info[0]
+        for record_type, key in (('a', 'ip'), ('aaaa', 'ipv6')):
+            records = current_dns.get(record_type, {})
+            if not isinstance(records, dict) or not isinstance(records.get('values', []), list):
+                malformed = True
+                continue
+            for record in records.get('values', []):
+                if not isinstance(record, dict) or not isinstance(record.get(key), str):
+                    malformed = True
+                    continue
+                try:
+                    ips.add(str(ip_address(record[key].strip())))
+                except ValueError:
+                    malformed = True
+        return malformed
 
-    async def process(self, proxy=False) -> None:
+    def _parse_subdomains(self, data: dict[str, Any]) -> bool:
+        values = data.get('subdomains')
+        if not isinstance(values, list):
+            return True
+        malformed = False
+        hostnames = self.info[1]
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                malformed = True
+                continue
+            if hostname := normalize_scoped_hostname(f'{value}.{self.word}', self.word):
+                hostnames.add(hostname)
+        return malformed
+
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
         self.proxy = proxy
-        await self.authenticate()
-        await self.do_search()
-        parser = securitytrailsparser.Parser(word=self.word, text=self.totalresults)
-        self.info = await parser.parse_text()
-        # Create parser and set self.info to tuple returned from parsing text.
-        print('\tDone Searching Results')
+        self._report = None
+        headers = {'APIKEY': self.key, 'Accept': 'application/json'}
+        try:
+            async with AsyncFetcher.open_session(headers=headers, proxy=proxy) as session:
+                domain_response = await AsyncFetcher.fetch(
+                    session=session,
+                    url=f'{self.api}domain/{self.word}',
+                    json=True,
+                    include_metadata=True,
+                )
+                domain_body = self._body(domain_response)
+                if domain_body is None:
+                    return self._report
+                self.domain_data = domain_body
+                malformed = self._parse_domain(domain_body)
 
-    async def get_ips(self) -> set:
+                subdomain_response = await AsyncFetcher.fetch(
+                    session=session,
+                    url=f'{self.api}domain/{self.word}/subdomains',
+                    json=True,
+                    include_metadata=True,
+                )
+                subdomain_body = self._body(subdomain_response)
+                if subdomain_body is None:
+                    return self._report
+                self.subdomains_data = subdomain_body
+                malformed = self._parse_subdomains(subdomain_body) or malformed
+        except Exception:
+            return SourceExecutionReport('failed', 'transport-error')
+        if malformed:
+            return SourceExecutionReport('failed', 'invalid-response')
+        return None
+
+    async def get_ips(self) -> set[str]:
         return self.info[0]
 
-    async def get_hostnames(self) -> set:
+    async def get_hostnames(self) -> set[str]:
         return self.info[1]

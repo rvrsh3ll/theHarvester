@@ -1,136 +1,410 @@
-![theHarvester](https://github.com/laramies/theHarvester/blob/master/theHarvester-logo.png)
+# theHarvester
 
-![TheHarvester CI](https://github.com/laramies/theHarvester/workflows/TheHarvester%20Python%20CI/badge.svg) ![TheHarvester Docker Image CI](https://github.com/laramies/theHarvester/workflows/TheHarvester%20Docker%20Image%20CI/badge.svg) [![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/laramies/theHarvester.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/laramies/theHarvester/context:python)
-[![Rawsec's CyberSecurity Inventory](https://inventory.rawsec.ml/img/badges/Rawsec-inventoried-FF5050_flat_without_logo.svg)](https://inventory.rawsec.ml/)
+![theHarvester logo](theHarvester-logo.webp)
 
-What is this?
--------------
-theHarvester is a very simple to use, yet powerful and effective tool designed to be used in the early stages of a<br>
-penetration test or red team engagement. Use it for open source intelligence (OSINT) gathering to help determine a<br>
-company's external threat landscape on the internet. The tool gathers emails, names, subdomains, IPs and URLs using<br>
-multiple public data sources that include:
+[![Python CI](https://github.com/laramies/theHarvester/actions/workflows/theHarvester.yml/badge.svg)](https://github.com/laramies/theHarvester/actions/workflows/theHarvester.yml)
+[![Docker CI](https://github.com/laramies/theHarvester/actions/workflows/dockerci.yml/badge.svg)](https://github.com/laramies/theHarvester/actions/workflows/dockerci.yml)
 
-Passive:
---------
-* baidu: Baidu search engine - www.baidu.com
+theHarvester gathers open-source intelligence about a domain or organization from search engines, certificate transparency logs, DNS datasets, code repositories, threat-intelligence platforms, and other public sources. It normalizes hostnames, email addresses, IP addresses, URLs, ASNs, people, breach names, and structured evidence from optional actions.
 
-* bing: Microsoft search engine - www.bing.com
+Use theHarvester during the early reconnaissance stage of an authorized security assessment. Run it only against targets you own or have explicit permission to test.
 
-* bingapi: Microsoft search engine, through the API (Requires an API key, see below.)
+## Quick start
 
-* bufferoverun: Uses data from Rapid7's Project Sonar - www.rapid7.com/research/project-sonar/
+theHarvester requires Python 3.14 and [uv](https://docs.astral.sh/uv/getting-started/installation/). The repository's `.python-version` lets `uv` select the required Python version automatically:
 
-* censys: Censys search engine, will use certificates searches to enumerate subdomains (Requires an API key, see below.) - [censys.io](https://censys.io/)
+```bash
+git clone https://github.com/laramies/theHarvester.git
+cd theHarvester
+uv sync
+uv run theHarvester -d example.com -b crtsh,certspotter
+```
 
-* certspotter: Cert Spotter monitors Certificate Transparency logs - https://sslmate.com/certspotter/
+This first run uses two P0 passive sources that need no API key. Passive means the target is not contacted directly, but the selected providers still receive the target string. The terminal reports each source outcome and any retained findings. A source can complete with zero findings, stop early with partial evidence, or fail without erasing evidence retained by other sources.
 
-* crtsh: Comodo Certificate search - https://crt.sh
+See the [installation guide](docs/wiki/Installation.md) for packaged distributions and platform-specific setup.
 
-* dnsdumpster: DNSdumpster search engine - https://dnsdumpster.com
+## Choose how to work
 
-* duckduckgo: DuckDuckGo search engine - www.duckduckgo.com
+| Interface | Best for | Start with |
+| --- | --- | --- |
+| CLI | One-off reconnaissance and shell workflows | `uv run theHarvester -h` |
+| HarvestView | Local run history, evidence review, hostname changes, and schedules | `uv run harvestview` |
+| REST API | Authenticated local automation and integrations | `http://127.0.0.1:5000/docs` |
 
-* exalead: a Meta search engine - www.exalead.com/search
+The CLI, REST API, and HarvestView share one finite-run engine and normalized evidence model. HarvestView provides the local browser interface.
 
-* github-code: GitHub code search engine (Requires a GitHub Personal Access Token, see below.) - www.github.com
+## Common workflows
 
-* google: Google search engine (Optional Google dorking.) - www.google.com
+Query several P0 passive sources:
 
-* hackertarget: Online vulnerability scanners and network intelligence to help organizations - https://hackertarget.com
+```bash
+uv run theHarvester -d example.com -b crtsh,certspotter,commoncrawl
+```
 
-* hunter: Hunter search engine (Requires an API key, see below.) - www.hunter.io
+Three discovery sources run at once by default. Use `-j` or `--source-workers` to change the worker count. Every selected source still runs.
 
-* intelx: Intelx search engine (Requires an API key, see below.) - www.intelx.io
+Run every source that can contribute subdomains:
 
-* linkedin: Google search engine, specific search for LinkedIn users - www.linkedin.com
+```bash
+uv run theHarvester -d example.com -b subdomains
+```
 
-* linkedin_links: specific search for LinkedIn users for target domain
+Combine capability selectors, or mix them with explicit source names:
 
-* netcraft: Internet Security and Data Mining - www.netcraft.com
+```bash
+uv run theHarvester -d example.com -b emails,urls,certspotter
+```
 
-* omnisint: Project Crobat, A Centralised Searchable Open Source Project Sonar DNS Database - https://github.com/Cgboal/SonarSearch
+Capability selectors form a union and choose which sources run. They do not discard other result types returned by those sources. Available selectors are `subdomains`, `emails`, `ips`, `asns`, `urls`, `people`, and `breaches`. `-b all` runs every cataloged P0 passive source. P1 DNS and P2 direct sources require explicit selection.
 
-* otx: AlienVault Open Threat Exchange - https://otx.alienvault.com
+Pass `--limit 0` to remove the shared per-source result cap and local page ceilings. Provider quotas and runtime safeguards still apply. If a provider or safety limit stops a source after retaining results, the run keeps them and records a partial outcome with the stop reason.
 
-* pentesttools: Powerful Penetration Testing Tools, Easy to Use (Needs an API key and is not free for API access) - https://pentest-tools.com/home
+Exclude hostname results while retaining other result types:
 
-* projecdiscovery: We actively collect and maintain internet-wide assets data, 
-to enhance research and analyse changes around DNS for better insights - https://chaos.projectdiscovery.io
-(Requires an API key)
+```bash
+uv run theHarvester -d example.com -b emails,ips,urls --no-hosts -f non-host-results
+```
 
-* qwant: Qwant search engine - www.qwant.com
+`--no-hosts` skips hostname-only sources and omits hostname results while keeping other result types. It cannot be combined with actions that depend on hostnames. HarvestView and the REST API expose the same option as `no_hosts`.
 
-* rapiddns: DNS query tool which make querying subdomains or sites of a same IP easy! https://rapiddns.io
+Save results as JSONL:
 
-* securityTrails: Security Trails search engine, the world's largest repository of historical DNS data<br>
-  (Requires an API key, see below.) - www.securitytrails.com
+```bash
+uv run theHarvester -d example.com -b crtsh,certspotter -f report
+```
 
-* shodan: Shodan search engine, will search for ports and banners from discovered hosts (Requires an API key, see below.) - www.shodanhq.com
+This writes `report.jsonl` for automation and interchange plus `report.json` and `report.xml` compatibility reports. Completed runs are also retained in the local SQLite evidence store.
 
-* spyse: Web research tools for professionals (Requires an API key.) - https://spyse.com
+Resolve discovered hosts for an authorized domain with the default resolver list:
 
-* sublist3r: Fast subdomains enumeration tool for penetration testers - https://api.sublist3r.com/search.php?domain=example.com
+```bash
+AUTHORIZED_DOMAIN='replace-with-a-domain-you-control'
+uv run theHarvester -d "$AUTHORIZED_DOMAIN" -b crtsh,certspotter -r
+```
 
-* threatcrowd: Open source threat intelligence - www.threatcrowd.org
+List every option and its current behavior:
 
-* threatminer: Data mining for threat intelligence - https://www.threatminer.org/
+```bash
+uv run theHarvester -h
+```
 
-* trello: Search trello boards (Uses Google search.)
+## Activity and scope
 
-* twitter: Twitter accounts related to a specific domain (Uses Google search.)
+P0, P1, and P2 describe observable network behavior, not confidence or importance.
 
-* urlscan: A sandbox for the web that is a URL and website scanner - https://urlscan.io
+| Class | Network behavior | Examples |
+| --- | --- | --- |
+| P0 | Queries an existing provider or dataset without directing traffic toward the target | Search, certificate transparency, code, and passive DNS providers |
+| P1 | Queries DNS about authorized names or addresses | Resolution, brute force, recursive DNS, and reverse lookup |
+| P2 | Contacts a target endpoint or causes equivalent direct interaction | HTTP, TLS, screenshots, takeover checks, virtual hosts, ports, and API paths |
 
-* vhost: Bing virtual hosts search
+P1 and P2 activity runs only when you select it. A discovered related hostname, network, ASN, or URL remains review evidence and does not expand the authorized target automatically. The exact hostname matters: `www.example.test` and `example.test` are different targets unless the engagement authorizes both.
 
-* virustotal: virustotal.com domain search
+Common active options include DNS resolution (`-r`), DNS brute force (`-c`), reverse DNS (`-n`), recursive DNS (`--dns-recursive-depth`), takeover checks (`-t`), API path scanning (`-a`), and screenshots (`--screenshot`). A takeover indicator is evidence for review, not proof that a provider resource can be claimed.
 
-* yahoo: Yahoo search engine
+Read [Responsible use and scope](docs/wiki/Responsible-Use-and-Scope.md) before active work. [Operator workflows](docs/wiki/Operator-Workflows.md) covers limits, resolvers, proxies, and action-specific behavior. With explicit proxy mode enabled, supported discovery and actions fail closed when no proxy is available instead of sending a direct request.
 
+## A practical engagement workflow
 
-Active:
--------
-* DNS brute force: dictionary brute force enumeration
-* Screenshots: Take screenshots of subdomains that were found
+1. Record the exact targets and activity the engagement authorizes.
+2. Start with a bounded P0 run and inspect every source outcome, including zero-result and partial sources.
+3. Add only the P1 or P2 actions the engagement authorizes for that target.
+4. Review normalized results, retained DNS evidence, stop reasons, and artifacts together.
+5. Compare finalized runs with matching targets, source sets, limits, and resolvers collected in comparable time windows.
+6. Export the required evidence, then pause or delete schedules and verify that no queued or running work remains when authorization ends.
 
-Modules that require an API key:
---------------------------------
-Documentation to setup API keys can be found at - https://github.com/laramies/theHarvester/wiki/Installation#api-keys
+## Architecture at a glance
 
-* bing
-* github
-* hunter - limited to 10 on the free plan so you will need to do -l 10 switch
-* intelx
-* pentesttools
-* projecdiscovery - invite only for now
-* securityTrails
-* shodan
-* spyse - need to have a paid account be able to use the api now
-* censys
+### From authorized target to retained evidence
 
-Install and dependencies:
--------------------------
-* Python 3.7+
-* https://github.com/laramies/theHarvester/wiki/Installation
+[![theHarvester discovery routes and enrichment](docs/images/run-evidence-architecture.svg)](docs/images/run-evidence-architecture.svg)
 
+### HarvestView local control and evidence
 
-Comments, bugs and requests:
-----------------------------
-* [![Twitter Follow](https://img.shields.io/twitter/follow/laramies.svg?style=social&label=Follow)](https://twitter.com/laramies) Christian Martorella @laramies
-cmartorella@edge-security.com
-* [![Twitter Follow](https://img.shields.io/twitter/follow/NotoriousRebel1.svg?style=social&label=Follow)](https://twitter.com/NotoriousRebel1) Matthew Brown @NotoriousRebel1
-* [![Twitter Follow](https://img.shields.io/twitter/follow/jay_townsend1.svg?style=social&label=Follow)](https://twitter.com/jay_townsend1) Jay "L1ghtn1ng" Townsend @jay_townsend1
+[![HarvestView run desk architecture](docs/images/harvestview-architecture.svg)](docs/images/harvestview-architecture.svg)
 
+## Read run results correctly
 
-Main contributors:
-------------------
-* [![Twitter Follow](https://img.shields.io/twitter/follow/NotoriousRebel1.svg?style=social&label=Follow)](https://twitter.com/NotoriousRebel1) Matthew Brown @NotoriousRebel1
-* [![Twitter Follow](https://img.shields.io/twitter/follow/jay_townsend1.svg?style=social&label=Follow)](https://twitter.com/jay_townsend1) Jay "L1ghtn1ng" Townsend @jay_townsend1
-* [![Twitter Follow](https://img.shields.io/twitter/follow/discoverscripts.svg?style=social&label=Follow)](https://twitter.com/discoverscripts) Lee Baird @discoverscripts 
-* [![LinkedIn](https://static.licdn.com/scds/common/u/img/webpromo/btn_viewmy_160x25.png)](https://www.linkedin.com/in/janoszold/)  Janos Zold
+theHarvester reports control flow, evidence quality, and producer outcomes separately:
 
+| Layer | States | What it answers |
+| --- | --- | --- |
+| Run lifecycle | queued, running, cancelling, cancelled, completed, failed | Is execution still active? |
+| Terminal evidence | complete, partial, failed | How complete is the retained run evidence? |
+| Source or action outcome | completed, partial, failed, rate-limited, skipped | What happened to this producer? |
 
-Thanks:
--------
-* John Matherly - Shodan project
-* Ahmed Aboul Ela - subdomain names dictionaries (big and small)
+A completed source with zero results is not the same as a partial or failed source. A cancelled or failed run can still retain useful evidence collected before execution stopped. Read the outcome and stop reason before treating absence as a finding.
+
+## HarvestView
+
+`harvestview` starts the local web application and API on `127.0.0.1:5000` by default:
+
+```bash
+export THEHARVESTER_API_KEY='replace-with-a-long-random-value'
+uv run harvestview
+```
+
+Open [HarvestView](http://127.0.0.1:5000/) to start runs and inspect history, results, producer outcomes, retained artifacts, and hostname changes. [Schedules](http://127.0.0.1:5000/schedules) can persist a timezone-aware run template across one or many authorized targets. Each occurrence creates an ordinary finite run per target, and the single local worker executes them serially.
+
+SQLAlchemy stores schedule control state in a separate mode-`0600` SQLite database that is excluded from portable run exports. Pausing a schedule prevents future occurrences but does not cancel runs already queued or running. Delete or pause schedules and inspect their dispatch history before an authorization window closes.
+
+The browser receives a derived HttpOnly session cookie and never stores the API key. Keep HarvestView on loopback unless you add TLS and network access controls. See the [installation guide](docs/wiki/Installation.md) for local assets, screenshot support, and isolated deployments.
+
+HarvestView can start screenshot and DNS brute-force runs from a retained hostname. Each action creates a separate finite run and leaves the parent evidence unchanged.
+
+## Track hostname changes
+
+`harvest-report hostname-changes` compares finalized SQLite evidence without running discovery or DNS. Select a run to compare it with its previous comparable run, or select a target to see the comparisons over time:
+
+```bash
+uv run harvest-report hostname-changes --run-id 11111111-1111-4111-8111-111111111111
+uv run harvest-report hostname-changes --target example.test
+uv run harvest-report hostname-changes --target example.test --include-still-reported
+```
+
+The previous comparable run is the latest earlier finalized run with the same canonical target and exact source list. The comparison classifies hostnames as `newly_reported`, `still_reported`, `no_longer_reported`, or `uncertain`. When only one run reports a hostname, it counts as newly reported or no longer reported only if every source that reported it completed successfully in the other run. Otherwise the difference is uncertain and includes the incomplete source outcomes and reasons.
+
+No longer reported means absent from comparable saved evidence. It does not prove that the hostname stopped existing or resolving. Repeated comparable runs provide a change history; the command does not create alerts, trigger actions, or allow mixed-target timelines. Read [Results and local data](docs/wiki/Results-and-Local-Data.md#compare-hostnames-between-saved-runs) for the complete pairing and interpretation rules.
+
+## REST API and Docker Compose
+
+Open [Swagger](http://127.0.0.1:5000/docs) or [ReDoc](http://127.0.0.1:5000/redoc) for the current automation contract. API clients send `THEHARVESTER_API_KEY` in the `X-API-Key` header; provider credentials remain on the server.
+
+### Docker Compose
+
+The Compose service runs as an unprivileged user and binds only to host loopback. It stores runs in a named volume and reads the operator key from a file secret:
+
+```bash
+install -d -m 0700 .secrets
+openssl rand -hex 32 > .secrets/operator-api-key
+chmod 0444 .secrets/operator-api-key
+docker compose up --build -d
+docker compose ps
+```
+
+```bash
+docker compose logs -f theharvester.svc.local
+docker compose down
+```
+
+<details>
+<summary><strong>View REST API routes</strong></summary>
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/v1/sources` | List registered discovery sources and capabilities. |
+| `POST /api/v1/runs` | Submit a finite enumeration run. |
+| `GET /api/v1/runs` | List durable run records. |
+| `GET /api/v1/runs/{run_id}` | Retrieve lifecycle state, normalized results, source contributions, and hostname comparisons. |
+| `POST /api/v1/runs/{run_id}/cancel` | Cancel queued or running work. |
+| `POST /api/v1/runs/import` | Import JSONL evidence without executing discovery. |
+| `POST /api/v1/runs/import-database` | Import completed runs from a theHarvester SQLite database. |
+| `GET /api/v1/runs/export-database` | Export all completed run evidence as a portable SQLite database. |
+| `GET /api/v1/runs/{run_id}/export` | Export normalized evidence as JSONL. |
+| `GET/POST /api/v1/schedules` | List or create persistent local schedules. |
+| `GET /api/v1/schedules/health` | Report scheduler and execution-worker availability. |
+| `GET/PUT/DELETE /api/v1/schedules/{schedule_id}` | Read, replace, or delete a schedule without deleting its runs. |
+| `POST /api/v1/schedules/{schedule_id}/pause` | Pause future occurrences without cancelling queued or running work. |
+| `POST /api/v1/schedules/{schedule_id}/resume` | Resume future occurrences. |
+| `POST /api/v1/schedules/{schedule_id}/run-now` | Queue one extra occurrence without changing recurrence timing. |
+| `GET /api/v1/schedules/{schedule_id}/dispatches` | List per-target dispatch history. |
+
+</details>
+
+The [REST API guide](docs/wiki/Rest-API.md) documents requests, hostname comparisons, imports, exports, schedules, and authentication.
+
+## Discovery sources
+
+Select sources by name or by a capability listed below. `-b all` runs the P0 sources. P1 and P2 sources require explicit selection.
+
+Result types in this table always appear in this order: `subdomains`, `emails`, `ips`, `asns`, `urls`, `people`, `breaches`. A result followed by `only` means the source contributes no other result type. The `API key` column refers to provider settings in `api-keys.yaml`; some providers require more than one value. `Optional` means the source can run without a key.
+
+The `shodan` source contributes subdomains. Shodan host enrichment through `-s` or `--shodan` is a separate action and is not a source result route.
+
+<details>
+<summary><strong>View all 66 discovery sources</strong></summary>
+
+| Source | Returns | Activity | API key |
+| --- | --- | :---: | :---: |
+| [`apis-guru`](https://apis.guru/) | subdomains, emails, urls | P0 | No |
+| [`arquivo`](https://arquivo.pt/) | subdomains only | P0 | No |
+| [`baidu`](https://www.baidu.com/) | subdomains, emails | P0 | No |
+| [`bevigil`](https://bevigil.com/osint-api) | subdomains, urls | P0 | Required |
+| [`brave`](https://brave.com/search/api/) | subdomains, emails | P0 | Required |
+| [`bufferoverun`](https://tls.bufferover.run/) | subdomains, ips | P0 | Required |
+| [`builtwith`](https://builtwith.com/) | subdomains, urls | P0 | Required |
+| [`censys`](https://search.censys.io/) | subdomains, emails | P0 | Required |
+| [`certspotter`](https://sslmate.com/certspotter/) | subdomains only | P0 | No |
+| [`commoncrawl`](https://commoncrawl.org/) | subdomains only | P0 | No |
+| [`criminalip`](https://www.criminalip.io/) | subdomains, ips, asns | P2 | Required |
+| [`crt-name`](https://crt.name/) | subdomains only | P0 | No |
+| [`crtsh`](https://crt.sh/) | subdomains only | P0 | No |
+| [`darkeye`](https://darkeye.io/) | breaches only | P0 | Required |
+| [`dehashed`](https://dehashed.com/) | emails, ips | P0 | Required |
+| [`dnsdb`](https://docs.domaintools.com/api/dnsdb/) | subdomains only | P0 | Required |
+| [`dnsdumpster`](https://dnsdumpster.com/) | subdomains, ips | P0 | Required |
+| [`duckduckgo`](https://duckduckgo.com/) | subdomains, emails | P0 | No |
+| [`dymo`](https://docs.tpeoficial.com/docs/dymo-api/private/data-verifier) | subdomains only | P0 | Required |
+| [`fofa`](https://en.fofa.info/) | subdomains, ips | P0 | Required |
+| [`fullhunt`](https://fullhunt.io/) | subdomains only | P0 | Required |
+| [`github-code`](https://github.com/) | subdomains, emails | P0 | Required |
+| [`gitlab`](https://gitlab.com/) | subdomains, emails, urls | P0 | No |
+| [`hackertarget`](https://hackertarget.com/) | subdomains, ips | P0 | Optional |
+| [`haveibeenpwned`](https://haveibeenpwned.com/) | breaches only | P0 | No |
+| [`hibpverified`](https://haveibeenpwned.com/API/v3#BreachedDomain) | emails, breaches | P0 | Required |
+| [`hudsonrock`](https://www.hudsonrock.com/) | subdomains, emails, ips | P0 | No |
+| [`hunter`](https://hunter.io/) | subdomains, emails | P0 | Required |
+| [`hunterhow`](https://hunter.how/) | subdomains only | P0 | Required |
+| [`intelx`](https://intelx.io/) | subdomains, emails, urls | P0 | Required |
+| [`jsmon`](https://subdomains.jsmon.sh/login) | subdomains only | P0 | Required |
+| [`leakix`](https://leakix.net/) | subdomains only | P0 | Required |
+| [`leaklookup`](https://leak-lookup.com/) | emails, breaches | P0 | Required |
+| [`mojeek`](https://www.mojeek.com/services/search/web-search-api/) | subdomains, emails | P0 | Optional |
+| [`netlas`](https://netlas.io/) | subdomains only | P0 | Required |
+| [`onyphe`](https://www.onyphe.io/) | subdomains, ips, asns | P0 | Required |
+| [`otilabs`](https://oti-labs.com/domain-intelligence-api) | subdomains, ips | P0 | Required |
+| [`otx`](https://otx.alienvault.com/) | subdomains, ips | P0 | No |
+| [`outcrawl`](https://outcrawl.ai/) | subdomains, emails | P0 | Required |
+| [`pentesttools`](https://pentest-tools.com/) | subdomains, ips | P1 | Required |
+| [`profundis`](https://docs.profundis.io/api/subdomain-enumeration/) | subdomains only | P0 | Required |
+| [`projectdiscovery`](https://chaos.projectdiscovery.io/) | subdomains only | P0 | Required |
+| [`rapiddns`](https://rapiddns.io/) | subdomains, ips | P0 | No |
+| [`robtex`](https://www.robtex.com/) | ips only | P0 | No |
+| [`rocketreach`](https://rocketreach.co/) | emails, urls | P0 | Required |
+| [`scanmalware`](https://scanmalware.com/) | subdomains only | P0 | No |
+| [`securityscorecard`](https://securityscorecard.com/) | subdomains, ips | P0 | Required |
+| [`securityTrails`](https://securitytrails.com/) | subdomains, ips | P0 | Required |
+| [`serply`](https://serply.io/) | subdomains, emails | P0 | Required |
+| [`sherlockeye`](https://sherlockeye.io/) | subdomains, emails, ips | P0 | Required |
+| [`shodan`](https://www.shodan.io/) | subdomains only | P1 | Required |
+| [`shodanct`](https://ctl.shodan.io/) | subdomains only | P0 | No |
+| [`shodanInternetDB`](https://internetdb.shodan.io/) | subdomains, ips | P1 | No |
+| [`sourcegraph`](https://sourcegraph.com/search) | subdomains only | P0 | No |
+| [`subdomainapi`](https://api.subdomain.app/) | subdomains only | P0 | No |
+| [`subdomaincenter`](https://www.subdomain.center/) | subdomains only | P0 | No |
+| [`subdomainfinderc99`](https://subdomainfinder.c99.nl/) | subdomains only | P1 | No |
+| [`thc`](https://ip.thc.org/) | subdomains only | P0 | No |
+| [`tomba`](https://tomba.io/) | subdomains, emails | P0 | Required |
+| [`urlscan`](https://urlscan.io/) | subdomains, ips, asns, urls | P0 | No |
+| [`virustotal`](https://www.virustotal.com/) | subdomains only | P0 | Required |
+| [`waybackarchive`](https://web.archive.org/) | subdomains only | P0 | No |
+| [`whoisxml`](https://subdomains.whoisxmlapi.com/) | subdomains only | P0 | Required |
+| [`windvane`](https://windvane.lichoin.com/) | subdomains, emails, ips | P0 | Optional |
+| [`yahoo`](https://www.yahoo.com/) | subdomains, emails | P0 | No |
+| [`zoomeye`](https://www.zoomeye.ai/) | subdomains, emails, ips, asns, urls | P0 | Required |
+
+</details>
+
+Each source name links to its provider's site or documentation for current plans, quotas, and terms. See [Configuration and API keys](docs/wiki/Configuration-and-API-Keys.md) for the required fields and setup instructions. Contributors can add a provider through the [module guide](docs/wiki/How-to-add-a-new-module.md). The CLI and API read their source inventory from the source catalog.
+
+## Configuration
+
+On first use, theHarvester creates default configuration files under `~/.theHarvester/`. It also reads system configuration from `/etc/theHarvester/` and `/usr/local/etc/theHarvester/`.
+
+- `api-keys.yaml` stores provider API keys and related values such as organization IDs.
+- `proxies.yaml` configures HTTP and SOCKS5 proxies used with `-p`.
+- The `shodan` source and `-s` / `--shodan` enrichment use Shodan's Host REST API. When `-p` is enabled, both send those requests through `proxies.yaml`.
+- `routeviews.key` is optional and enables authenticated RouteViews access for PeeringDB-verified users.
+
+Never commit populated configuration files, API keys, account details, or provider responses.
+
+For JSMON, set `apikeys.jsmon.key` in `api-keys.yaml`:
+
+```bash
+uv run theHarvester -d example.com -b jsmon -l 100
+```
+
+Use `-l 0` to follow all pages reported by JSMON without a local result cap. HTTP 403 (plan quota) or 429 (rate limit) stops collection immediately without retrying; results from earlier pages are retained.
+
+## Output and local data
+
+Terminal output is intended for interactive use. `-f NAME` also writes `NAME.jsonl`, `NAME.json`, and `NAME.xml`. Screenshots go to the directory passed to `--screenshot`, and completed runs are stored in `~/.local/share/theHarvester/stash.sqlite`.
+
+Treat collected OSINT as potentially sensitive. Keep report files, screenshots, and the local database out of source control and share them only within the authorized engagement. Screenshots can contain login pages, internal names, and other target content; the database retains their metadata but does not embed the image files.
+
+### JSONL
+
+JSONL is the primary format for automation and one-run interchange. The first line summarizes run status, producer outcomes, counts, timestamps, and artifacts. Each remaining line is one sorted, deduplicated finding with its source and action provenance. The example below contains six findings from two sources.
+
+<details>
+<summary><strong>View a complete JSONL example</strong></summary>
+
+```jsonl
+{"action_executions":[],"artifacts":[],"completed_at":"2026-08-17T12:01:00Z","counts":{"asn":1,"breach":1,"email":1,"hostname":1,"ip":1,"url":1},"evidence_status":"complete","result_count":6,"run_id":"123e4567-e89b-12d3-a456-426614174000","source_executions":[{"duration_ms":127.4,"error_type":null,"result_count":1,"source":"haveibeenpwned","status":"completed","stop_reason":null},{"duration_ms":482.3,"error_type":null,"result_count":5,"source":"zoomeye","status":"completed","stop_reason":null}],"started_at":"2026-08-17T12:00:00Z","target":"example.com","type":"summary"}
+{"sources":["zoomeye"],"type":"asn","value":"AS64500"}
+{"sources":["haveibeenpwned"],"type":"breach","value":"Example breach"}
+{"sources":["zoomeye"],"type":"email","value":"security@example.com"}
+{"sources":["zoomeye"],"type":"hostname","value":"api.example.com"}
+{"sources":["zoomeye"],"type":"ip","value":"192.0.2.10"}
+{"sources":["zoomeye"],"type":"url","value":"https://api.example.com/login"}
+```
+
+</details>
+
+Extract common result types with `jq`:
+
+```bash
+jq -r 'select(.type == "hostname") | .value' report.jsonl
+jq -r 'select(.type == "ip") | .value' report.jsonl
+jq -r 'select(.type == "asn") | .value' report.jsonl
+jq -r 'select(.type == "email") | .value' report.jsonl
+jq -r 'select(.type == "url") | .value' report.jsonl
+jq -c 'select(.type == "person") | .value | fromjson' report.jsonl
+jq -r 'select(.type == "breach") | .value' report.jsonl
+```
+
+Some result types carry structured evidence. `person`, `infostealer`, and recursive DNS values contain JSON strings and need a second `fromjson` step. Shodan hosts use `details`; virtual hosts, network prefixes, and ASN attribution use native observations. Takeover results keep the hostname in `value` and their DNS, wildcard, HTTP, rule, status, and error evidence in `details`.
+
+```bash
+jq -c 'select(.type == "dns-recursive-finding") | .value | fromjson' report.jsonl
+jq -c 'select(.type == "shodan-host") | {ip: .value, services: .details.services}' report.jsonl
+jq -c 'select(.type == "hostname" and .observations) | {hostname: .value, observations}' report.jsonl
+jq -c 'select(.type == "asn" and .observations) | {asn: .value, observations}' report.jsonl
+```
+
+List every finding as tab-separated type and value columns:
+
+```bash
+jq -r 'select(.type != "summary") | [.type, .value] | @tsv' report.jsonl
+```
+
+The `subdomains` capability produces `hostname` records because a result can be the target hostname itself. Read [Results and local data](docs/wiki/Results-and-Local-Data.md) for the complete JSONL and evidence contract.
+
+### Compare saved runs
+
+`harvest-report` reads completed runs from an existing SQLite results database. Its subcommands list saved targets, count each source's contribution, and compare hostname evidence between runs:
+
+```bash
+uv run harvest-report targets
+uv run harvest-report contributions --target example.test
+uv run harvest-report contributions --database results.sqlite --kind ip --format json
+uv run harvest-report hostname-changes --target example.test
+```
+
+The command reads saved evidence without running discovery or DNS. Use `--target` or `--run-id` when a database contains several targets, or select `--all-targets` for a deliberate aggregate. For useful comparisons, keep the target, source list, limit, resolvers, release version, and collection window consistent. The [results guide](docs/wiki/Results-and-Local-Data.md) explains the fields, target scope, and comparison rules.
+
+### SQLite, JSON, and XML
+
+CLI and API runs use the same SQLite evidence model. JSONL moves one run at a time. SQLite import and export handle completed runs in bulk but exclude queue and worker state. Screenshot files remain separate from their metadata.
+
+JSON and XML are compatibility reports grouped by result type. They do not include the full provenance, lifecycle outcomes, or structured action evidence available in JSONL, SQLite, the API, and HarvestView.
+
+## Development and contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, required checks, testing expectations, and pull-request process.
+
+## Package versions and license
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/theharvester.svg)](https://repology.org/project/theharvester/versions)
+
+theHarvester is distributed under the GNU General Public License version 2 only. See [LICENSE](LICENSE) for the complete license text.
+
+## Support and credits
+
+- Use [GitHub Issues](https://github.com/laramies/theHarvester/issues) for reproducible bugs and focused feature requests.
+- Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md), not in public issues.
+- [Christian Martorella (@laramies)](https://twitter.com/laramies) created theHarvester. Contact: [cmartorella@edge-security.com](mailto:cmartorella@edge-security.com).
+- [Matt Brown (@NotoriousRebel1)](https://twitter.com/NotoriousRebel1) and [Jay "L1ghtn1ng" Townsend (@jay_townsend1)](https://twitter.com/jay_townsend1) maintain and develop the project.
+- [Lee Baird (@discoverscripts)](https://twitter.com/discoverscripts) is a main contributor.
+- Thanks to John Matherly for Shodan and Ahmed Aboul Ela for the bundled subdomain dictionaries.

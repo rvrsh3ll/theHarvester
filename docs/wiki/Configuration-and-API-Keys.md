@@ -1,0 +1,93 @@
+# Configuration and API keys
+
+theHarvester reads `api-keys.yaml` and `proxies.yaml` from the first matching directory:
+
+1. `~/.theHarvester/`
+2. `/etc/theHarvester/`
+3. `/usr/local/etc/theHarvester/`
+
+If no file exists, theHarvester creates the default template under `~/.theHarvester/`.
+
+## Provider credentials
+
+Run theHarvester once to create the user configuration, then edit:
+
+```bash
+vi ~/.theHarvester/api-keys.yaml
+chmod 600 ~/.theHarvester/api-keys.yaml
+```
+
+Keep the complete generated template and fill only the providers you intend to use. Some providers require more than one field:
+
+```yaml
+apikeys:
+  censys:
+    token: your-censys-personal-access-token
+    organization_id: your-censys-organization-id
+
+  github:
+    key: your-github-token
+
+  hibpverified:
+    key: your-hibp-api-key
+
+  routeviews:
+    key: your-routeviews-api-key
+
+  tomba:
+    key: your-tomba-key
+    secret: your-tomba-secret
+```
+
+Do not commit populated configuration files. Prefer provider credentials scoped to the minimum access the provider supports.
+
+The [README source matrix](https://github.com/laramies/theHarvester/blob/dev/README.md#discovery-sources) lists each source's result routes, activity class, and credential requirement. Every source name links to its provider's site or documentation for current plans, quotas, and terms. The executable source catalog is the authoritative inventory.
+
+### Provider notes
+
+| Provider | Configuration and behavior |
+| --- | --- |
+| Censys | `censys.token` is a Censys Platform Personal Access Token. Set `organization_id` to search through an entitled organization. The source uses the Global Search API, which Free accounts cannot access because they are limited to asset lookups. Search API ID and secret fields are not accepted. |
+| DarkEye | Set `darkeye.haveibeenransom_key`, `darkeye.breachhouse_key`, or both under `apikeys` in `api-keys.yaml`, then run `uv run theHarvester -d example.com -b darkeye`. The source queries each DarkEye product that has a key and returns one breach name per record: the victim or dump title, the group or channel, and the product and category (ransomware leak, data breach, access lead or stealer log). Have I Been Ransomed? matches the exact domain, without subdomains, and each page of 20 leaks is one request against the key's daily quota, so `-l` bounds the number of requests as well as results. Breach House is one text search per domain, at most 200 records per category; records whose website is another domain are left out, and a record listed by both products is returned once. It never retrieves leaked records. See [Have I Been Ransomed? API](https://haveibeenransom.com/howapi) and [Breach House API](https://breach.house/docs) for the APIs, current plans and quotas. |
+| HIBP verified domains | `hibpverified` queries [HIBP's authenticated verified-domain endpoint](https://haveibeenpwned.com/API/v3#BreachedDomain). Select it by name, through the `breaches` capability, or with `all`. Without a configured key, it is skipped like other unavailable keyed sources. Live use requires a user-owned paid HIBP API key and a domain verified in that account. The keyless `haveibeenpwned` source queries only the public breach catalogue. |
+| JSMON | Set `jsmon.key` under `apikeys` in `api-keys.yaml`, then run `uv run theHarvester -d example.com -b jsmon -l 0`. Pagination follows the API's reported pages; `-l 0` removes the local result cap. HTTP 403 or 429 stops collection without retrying and preserves earlier results. See [JSMON](https://subdomains.jsmon.sh/login) for current access limits. |
+| Outcrawl | Set `outcrawl.key` under `apikeys` in `api-keys.yaml`, then run `uv run theHarvester -d example.com -b outcrawl -l 40`. The source sends two web searches per run, an exact-match query and a `site:` query, and each returns at most twenty ranked hits, so a run makes at most two requests. Each link counts once against `-l`, but text from a repeated link is still parsed. The second request asks for room for the links already seen, up to twenty, because it can repeat them; search is billed on the hits returned, so those repeated hits are billed too. A full twenty-hit window is reported as partial coverage (`provider-limit`). See [Outcrawl search](https://outcrawl.ai/docs/search/overview) for the API and how search is billed, and [Outcrawl pricing](https://outcrawl.ai/pricing) for current plans. |
+| Profundis | Set `profundis.key` and optionally `profundis.max_credits` under `apikeys`. The latter is a per-request spending ceiling (default `10`, integer `1`–`100000`), independent of `-l`, which only limits retained hostnames. `-l 0` still respects this spending ceiling. The source makes one request without retries and reports partial results if a credit or provider limit stops it. API access requires a paid plan or purchased credits. See the [API documentation](https://docs.profundis.io/api/subdomain-enumeration/) for access and billing details. |
+| RouteViews | `routeviews.key` is optional. A configured key selects the authenticated endpoint for PeeringDB-verified users and its documented 10-request-per-second allowance. Without a key, the action uses guest access at one request per second. If RouteViews rejects a configured key, the action fails instead of retrying as a guest. Remove the key to select guest access. RouteViews does not document this as a paid subscription. |
+| Serply | Set `serply.key` under `apikeys` in `api-keys.yaml`, then run `uv run theHarvester -d example.com -b serply -l 100`. Serply reads Google's index. Each request returns at most ten organic rows and is billed against the account's plan, so `-l` bounds the number of requests as well as results. Pagination uses the `start` offset, stops once a page repeats the previous window, and is bounded at ten pages per query. See [Serply](https://serply.io/docs) for the API and [Serply pricing](https://serply.io/pricing) for current plans and quotas. |
+
+## Proxies
+
+Edit `~/.theHarvester/proxies.yaml` using `host:port` entries:
+
+```yaml
+http:
+  - 127.0.0.1:8080
+socks5:
+  - 127.0.0.1:9050
+```
+
+Enable configured proxies with `-p`:
+
+Network activity: provider-facing passive lookup through a configured proxy.
+
+```bash
+uv run theHarvester -d example.com -b crtsh -p
+```
+
+A proxy does not make an assessment anonymous and does not change the authorization boundary. `--proxies` applies to
+supported HTTP(S) provider and target requests, which fail closed with `proxy-unavailable` instead of falling back to
+direct HTTP(S) when no configured proxy is available. DNS queries independently use the operator-selected recursive
+resolver addresses and may run alongside proxied HTTP(S); the resolver and local network can therefore observe that
+DNS traffic. A configured proxy transport failure is recorded as `transport-error`.
+
+## API protection
+
+Every `/api/v1/*` route requires a server-side key:
+
+```bash
+export THEHARVESTER_API_KEY='replace-with-a-long-random-value'
+uv run harvestview
+```
+
+API clients send the same value in the `X-API-Key` header. HarvestView receives a derived HttpOnly browser cookie when it is opened locally, so the key is never entered into or stored by the web app. Provider credentials remain in `api-keys.yaml` and cannot be supplied through an API request.

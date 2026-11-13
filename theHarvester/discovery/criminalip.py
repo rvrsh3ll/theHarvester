@@ -1,0 +1,358 @@
+import asyncio
+import logging
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+from theHarvester.discovery.constants import MissingKey, get_delay
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, Core, FetcherResponse
+from theHarvester.lib.source_execution import SourceExecutionReport
+
+if TYPE_CHECKING:
+    import aiohttp
+
+logger = logging.getLogger(__name__)
+
+
+class SearchCriminalIP:
+    def __init__(self, word: str) -> None:
+        self.word = word.lower().strip()
+        self.totalhosts: set = set()
+        self.totalips: set = set()
+        self.asns: set = set()
+        self.key = Core.criminalip_key()
+        if self.key is None:
+            raise MissingKey('criminalip')
+
+    def _normalize_host(self, hostname: str | None) -> str | None:
+        if not isinstance(hostname, str):
+            return None
+
+        cleaned = hostname.strip().lower().rstrip('.')
+        if not cleaned:
+            return None
+
+        cleaned = cleaned.removeprefix('*.')
+
+        if ':' in cleaned and cleaned.count(':') == 1:
+            host, port = cleaned.rsplit(':', 1)
+            if port.isdigit():
+                cleaned = host
+
+        if cleaned == self.word or cleaned.endswith('.' + self.word):
+            return cleaned
+        return None
+
+    def _add_host(self, hostname: str | None, include_root: bool = True) -> bool:
+        normalized = self._normalize_host(hostname)
+        if normalized is None:
+            return False
+        if include_root is False and normalized == self.word:
+            return False
+        self.totalhosts.add(normalized)
+        return True
+
+    def _add_host_from_url(self, url: str | None) -> None:
+        if not isinstance(url, str) or not url:
+            return
+        parsed_url = urlparse(url)
+        netloc = parsed_url.netloc
+        if not netloc:
+            return
+        if '@' in netloc:
+            netloc = netloc.rsplit('@', 1)[1]
+        self._add_host(netloc)
+
+    def _add_ip(self, ip: str | None) -> None:
+        if isinstance(ip, str) and ip.strip():
+            self.totalips.add(ip.strip())
+
+    def _add_asn(self, asn: str | int | None) -> None:
+        if asn is None:
+            return
+        asn_value = str(asn).strip()
+        if asn_value:
+            self.asns.add(asn_value)
+
+    def _collect_hosts_from_value(self, value) -> None:
+        if isinstance(value, str):
+            self._add_host(value.split()[0].rstrip('.'))
+            return
+        if isinstance(value, list):
+            for item in value:
+                self._collect_hosts_from_value(item)
+            return
+        if isinstance(value, dict):
+            self._add_host(value.get('domain'))
+            self._add_host(value.get('hostname'))
+            self._add_host(value.get('subdomain_name'))
+            for nested_value in value.values():
+                self._collect_hosts_from_value(nested_value)
+
+    @staticmethod
+    def _transport_report(response: object, stage: str) -> SourceExecutionReport | None:
+        """Classify transport and HTTP failures for one CriminalIP response."""
+        if not isinstance(response, FetcherResponse):
+            logger.info(f'CriminalIP {stage} request failed without a response')
+            return SourceExecutionReport('failed', 'transport-error')
+        if error := provider_http_error(response):
+            logger.info(f'CriminalIP {stage} request failed with HTTP {response.status}')
+            return SourceExecutionReport(*error)
+        return None
+
+    @staticmethod
+    def _provider_status_report(payload: dict, stage: str) -> SourceExecutionReport | None:
+        """Classify application-level status codes reported inside a 200 response."""
+        status = payload.get('status')
+        if status == 200:
+            return None
+        logger.info(f'CriminalIP {stage} request failed with status {status}')
+        if status == 429:
+            return SourceExecutionReport('rate-limited', 'http-429')
+        if status in {401, 403}:
+            return SourceExecutionReport('failed', 'access-denied')
+        return SourceExecutionReport('failed', 'provider-error')
+
+    async def do_search(self, session: aiohttp.ClientSession) -> SourceExecutionReport | None:
+        # https://www.criminalip.io/developer/api/post-domain-scan
+        # https://www.criminalip.io/developer/api/get-domain-status-id
+        # https://www.criminalip.io/developer/api/get-v2-domain-report-id
+        url = 'https://api.criminalip.io/v1/domain/scan'
+        response = await AsyncFetcher.post_fetch(
+            url,
+            json=True,
+            json_body={'query': self.word},
+            session=session,
+            include_metadata=True,
+        )
+        # Expected response format:
+        # {'data': {'scan_id': scan_id}, 'message': 'api success', 'status': 200}
+        if report := self._transport_report(response, 'scan'):
+            return report
+        if not isinstance(response.body, dict):
+            logger.info(f'CriminalIP scan response has unexpected type: {type(response.body).__name__}')
+            return SourceExecutionReport('failed', 'invalid-response')
+        if report := self._provider_status_report(response.body, 'scan'):
+            return report
+
+        scan_id = response.body.get('data', {}).get('scan_id')
+        if scan_id is None:
+            logger.info('CriminalIP scan response did not include a scan_id')
+            return SourceExecutionReport('failed', 'invalid-response')
+
+        scan_percentage = 0
+        counter = 0
+        status: dict[str, Any] = {}
+        while scan_percentage != 100:
+            status_url = f'https://api.criminalip.io/v1/domain/status/{scan_id}'
+            poll = await AsyncFetcher.fetch(
+                session=session,
+                url=status_url,
+                json=True,
+                request_timeout=60,
+                include_metadata=True,
+            )
+            if report := self._transport_report(poll, 'status'):
+                return report
+            if not isinstance(poll.body, dict):
+                logger.info(f'CriminalIP status response has unexpected type: {type(poll.body).__name__}')
+                return SourceExecutionReport('failed', 'invalid-response')
+            status = poll.body
+            if report := self._provider_status_report(status, 'status'):
+                return report
+
+            # Expected format:
+            # {"data": {"scan_percentage": 100}, "message": "api success", "status": 200}
+            scan_percentage = status.get('data', {}).get('scan_percentage')
+            if scan_percentage is None:
+                logger.info('CriminalIP status response did not include scan_percentage')
+                return SourceExecutionReport('failed', 'invalid-response')
+            if scan_percentage == 100:
+                break
+            if scan_percentage == -2:
+                logger.info(f'CriminalIP failed to scan: {self.word} does not exist, verify manually')
+                return None
+            if scan_percentage == -1:
+                logger.info('CriminalIP scan failed with scan_percentage -1')
+                return SourceExecutionReport('failed', 'provider-error')
+            # Wait for scan to finish
+            if counter >= 5:
+                await asyncio.sleep(20 * get_delay())
+            else:
+                await asyncio.sleep(10 * get_delay())
+            counter += 1
+            if counter == 10:
+                logger.info(
+                    'Ten iterations have occurred in CriminalIP waiting for scan to finish, returning to prevent infinite loop.'
+                )
+                return SourceExecutionReport('partial', 'runtime-limit')
+
+        report_url = f'https://api.criminalip.io/v2/domain/report/{scan_id}'
+        scan = await AsyncFetcher.fetch(
+            session=session,
+            url=report_url,
+            json=True,
+            request_timeout=60,
+            include_metadata=True,
+        )
+        if report := self._transport_report(scan, 'report'):
+            return report
+        if not isinstance(scan.body, dict):
+            logger.info(f'CriminalIP report response has unexpected type: {type(scan.body).__name__}')
+            return SourceExecutionReport('failed', 'invalid-response')
+        if report := self._provider_status_report(scan.body, 'report'):
+            return report
+
+        try:
+            await self.parser(scan.body)
+        except Exception as e:
+            logger.info(f'CriminalIP report parsing failed with {type(e).__name__}')
+            return SourceExecutionReport('failed', 'invalid-response')
+        return None
+
+    async def parser(self, jlines):
+        # TODO when new scope field is added to parse lines for potential new scope!
+        # TODO map as_name to asn for asn data
+        # TODO determine if returned URLs are useful
+        if not isinstance(jlines, dict) or 'data' not in jlines.keys() or not isinstance(jlines['data'], dict):
+            logger.info('CriminalIP report has an unexpected structure')
+            return
+        data = jlines['data']
+
+        for cert in data.get('certificates', []):
+            if isinstance(cert, dict):
+                self._add_host(cert.get('subject'))
+
+        for connected_domain in data.get('connected_domain_subdomain', []):
+            try:
+                if not isinstance(connected_domain, dict):
+                    continue
+                main_domain = connected_domain.get('main_domain', {}).get('domain')
+                if main_domain is not None:
+                    self._add_host(main_domain)
+                subdomains = [sub.get('domain') for sub in connected_domain.get('subdomains', []) if isinstance(sub, dict)]
+                for sub in subdomains:
+                    self._add_host(sub)
+            except Exception as e:
+                logger.info(f'CriminalIP connected-domain parsing failed with {type(e).__name__}')
+
+        for ip_info in data.get('connected_ip_info', []):
+            if not isinstance(ip_info, dict):
+                continue
+            self._add_asn(ip_info.get('asn'))
+            domains = [sub.get('domain') for sub in ip_info.get('domain_list', []) if isinstance(sub, dict)]
+            for sub in domains:
+                if self._add_host(sub):
+                    self._add_ip(ip_info.get('ip'))
+
+        for subdomain in data.get('subdomains', []):
+            if isinstance(subdomain, dict):
+                self._add_host(subdomain.get('subdomain_name'))
+                self._add_host(subdomain.get('domain'))
+
+        for cookie in data.get('cookies', []):
+            if isinstance(cookie, dict):
+                cookie_domain = cookie.get('domain')
+                if isinstance(cookie_domain, str):
+                    self._add_host(cookie_domain.lstrip('.'), include_root=False)
+
+        for connected_ip in data.get('connected_ip', []):
+            if isinstance(connected_ip, dict):
+                self._add_ip(connected_ip.get('ip'))
+
+        for mapped_ip in data.get('mapped_ip', []):
+            if isinstance(mapped_ip, dict):
+                self._add_ip(mapped_ip.get('ip'))
+
+        for country in data.get('country', []):
+            if not isinstance(country, dict):
+                continue
+            if self._add_host(country.get('domain')):
+                for ip in country.get('mapped_ips', []):
+                    if isinstance(ip, dict):
+                        self._add_ip(ip.get('ip'))
+
+        for k, v in data.get('dns_record', {}).items():
+            if k == 'dns_record_type_a':
+                dns_a_record = data.get('dns_record', {}).get(k, {})
+                if not isinstance(dns_a_record, dict):
+                    continue
+                for ip in dns_a_record.get('ipv4', []):
+                    if isinstance(ip, dict):
+                        self._add_ip(ip.get('ip'))
+                    elif isinstance(ip, str):
+                        self._add_ip(ip)
+                for ip in dns_a_record.get('ipv6', []):
+                    if isinstance(ip, dict):
+                        self._add_ip(ip.get('ip'))
+                    elif isinstance(ip, str):
+                        self._add_ip(ip)
+            elif isinstance(v, list) or isinstance(v, dict):
+                self._collect_hosts_from_value(v)
+
+        for domain_list in data.get('domain_list', []):
+            if not isinstance(domain_list, dict):
+                continue
+            self._add_asn(domain_list.get('asn'))
+            domains = [sub.get('domain') for sub in domain_list.get('domain_list', []) if isinstance(sub, dict)]
+            for sub in domains:
+                if self._add_host(sub):
+                    self._add_ip(domain_list.get('ip'))
+
+        for html_page_links in data.get('html_page_link_domains', []):
+            if not isinstance(html_page_links, dict):
+                continue
+            if self._add_host(html_page_links.get('domain')):
+                for ip in html_page_links.get('mapped_ips', []):
+                    if isinstance(ip, dict):
+                        self._add_ip(ip.get('ip'))
+
+        # TODO combine data['links'] and data['network_logs'] urls into one list for one run through
+        for link in data.get('links', []):
+            if isinstance(link, dict):
+                self._add_host_from_url(link.get('url'))
+
+        network_logs = data.get('network_logs', [])
+        if isinstance(network_logs, dict):
+            network_logs = network_logs.get('data', [])
+        if not isinstance(network_logs, list):
+            network_logs = []
+        for log in network_logs:
+            if not isinstance(log, dict):
+                continue
+            self._add_host_from_url(log.get('url'))
+            self._add_asn(log.get('as_number'))
+            ip_port = log.get('ip_port')
+            if isinstance(ip_port, str) and ':' in ip_port:
+                self._add_ip(ip_port.rsplit(':', 1)[0])
+
+        for redirects in data.get('page_redirections', []):
+            if isinstance(redirects, dict):
+                redirects = [redirects]
+            if not isinstance(redirects, list):
+                continue
+            for redirect in redirects:
+                if isinstance(redirect, dict):
+                    self._add_host_from_url(redirect.get('url'))
+
+    async def get_asns(self) -> set:
+        return self.asns
+
+    async def get_hostnames(self) -> set:
+        return self.totalhosts
+
+    async def get_ips(self) -> set:
+        return self.totalips
+
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
+        try:
+            async with AsyncFetcher.open_session(
+                headers={'User-Agent': Core.get_user_agent(), 'x-api-key': f'{self.key}'},
+                proxy=proxy,
+                request_timeout=720,
+            ) as session:
+                return await self.do_search(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return SourceExecutionReport('failed', 'transport-error')

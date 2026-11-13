@@ -1,34 +1,148 @@
-from theHarvester.lib.core import *
+import logging
+from urllib.parse import urlencode
+
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, FetcherResponse
+from theHarvester.lib.source_execution import SourceExecutionReport, SourceReportStatus
+
+logger = logging.getLogger(__name__)
 
 
 class SearchCertspoter:
+    """Search the SSLMate Cert Spotter CT Search API.
 
-    def __init__(self, word):
-        self.word = word
-        self.totalhosts = set()
+    API reference: https://sslmate.com/help/reference/ct_search_api_v1
+    """
+
+    def __init__(self, word: str) -> None:
+        self.word = word.strip().lower().rstrip('.')
+        self.totalhosts: set = set()
         self.proxy = False
+        self._report: SourceExecutionReport | None = None
 
-    async def do_search(self) -> None:
-        base_url = f'https://api.certspotter.com/v1/issuances?domain={self.word}&expand=dns_names'
+    def _mark_incomplete(self, reason: str, *, rate_limited: bool = False) -> None:
+        status: SourceReportStatus = 'rate-limited' if rate_limited else 'partial'
+        self._report = SourceExecutionReport(status, reason)
+
+    async def do_search(self, session) -> None:
+        base_url = 'https://api.certspotter.com/v1/issuances'
+        cursor = None
+        seen_cursors: set[str] = set()
         try:
-            response = await AsyncFetcher.fetch_all([base_url], json=True, proxy=self.proxy)
-            response = response[0]
-            if isinstance(response, list):
-                for dct in response:
-                    for key, value in dct.items():
-                        if key == 'dns_names':
-                            self.totalhosts.update({name for name in value if name})
-            elif isinstance(response, dict):
-                self.totalhosts.update({response['dns_names'] if 'dns_names' in response.keys() else ''})
-            else:
-                self.totalhosts.update({''})
-        except Exception as e:
-            print(e)
+            while True:
+                params = {
+                    'domain': self.word,
+                    'include_subdomains': 'true',
+                    'expand': 'dns_names',
+                }
+                if cursor is not None:
+                    params['after'] = cursor
+
+                responses = await AsyncFetcher.fetch_all(
+                    [f'{base_url}?{urlencode(params)}'], json=True, session=session, include_metadata=True
+                )
+                if not responses:
+                    self._mark_incomplete('no-response')
+                    logger.warning('Cert Spotter stopped early; results may be incomplete.')
+                    break
+
+                page = responses[0]
+                if not isinstance(page, FetcherResponse):
+                    self._mark_incomplete('transport-error')
+                    logger.warning('Cert Spotter stopped early; results may be incomplete.')
+                    break
+                if error := provider_http_error(page):
+                    self._report = SourceExecutionReport(*error)
+                    logger.warning(f'Cert Spotter stopped early ({error[1]}); results may be incomplete.')
+                    break
+                body = page.body
+                if isinstance(body, dict):
+                    code = body.get('code')
+                    if isinstance(code, str):
+                        self._mark_incomplete(code, rate_limited=code == 'rate_limited')
+                        logger.warning(f'Cert Spotter stopped early ({code}); results may be incomplete.')
+                    else:
+                        self._mark_incomplete('invalid-response')
+                        logger.warning('Cert Spotter stopped early; results may be incomplete.')
+                    break
+                if not isinstance(body, list):
+                    self._mark_incomplete('invalid-response')
+                    logger.warning('Cert Spotter stopped early; results may be incomplete.')
+                    break
+                if not body:
+                    break
+
+                malformed_issuance = False
+                for issuance in body:
+                    if not isinstance(issuance, dict):
+                        malformed_issuance = True
+                        continue
+                    dns_names = issuance.get('dns_names')
+                    if not isinstance(dns_names, list):
+                        malformed_issuance = True
+                        continue
+                    for name in dns_names:
+                        if not isinstance(name, str):
+                            malformed_issuance = True
+                            continue
+                        name = name.strip().lower().rstrip('.').removeprefix('*.')
+                        labels = name.split('.')
+                        if (
+                            name
+                            and len(name) <= 253
+                            and name.isascii()
+                            and '*' not in name
+                            and not any(character.isspace() for character in name)
+                            and all(
+                                label
+                                and len(label) <= 63
+                                and label[0].isalnum()
+                                and label[-1].isalnum()
+                                and all(character.isalnum() or character == '-' for character in label)
+                                for label in labels
+                            )
+                            and (name == self.word or name.endswith(f'.{self.word}'))
+                        ):
+                            self.totalhosts.add(name)
+                if malformed_issuance:
+                    self._mark_incomplete('malformed-issuance')
+                    logger.warning('Cert Spotter ignored malformed issuance data; results may be incomplete.')
+
+                last_issuance = body[-1]
+                next_cursor = last_issuance.get('id') if isinstance(last_issuance, dict) else None
+                if isinstance(next_cursor, str):
+                    next_cursor = next_cursor.strip()
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    self._mark_incomplete('invalid-cursor')
+                    logger.warning(
+                        'Cert Spotter stopped early because the response did not provide a valid cursor; '
+                        'results may be incomplete.'
+                    )
+                    break
+                if next_cursor in seen_cursors:
+                    self._mark_incomplete('repeated-cursor')
+                    logger.warning(
+                        'Cert Spotter stopped early because the response repeated a cursor; results may be incomplete.'
+                    )
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        except ConnectionError:
+            self._mark_incomplete('connection-error')
+            logger.warning('Cert Spotter network connection failed; results may be incomplete.')
+        except Exception:
+            self._mark_incomplete('unexpected-error')
+            logger.warning('Cert Spotter stopped after an unexpected error; results may be incomplete.')
 
     async def get_hostnames(self) -> set:
         return self.totalhosts
 
-    async def process(self, proxy=False):
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
         self.proxy = proxy
-        await self.do_search()
-        print('\tSearching results.')
+        self._report = None
+        async with AsyncFetcher.open_session(proxy=self.proxy, request_timeout=60) as session:
+            await self.do_search(session)
+        logger.info('\tSearching results.')
+        if self._report is not None and self._report.status == 'partial' and not self.totalhosts:
+            return SourceExecutionReport('failed', self._report.stop_reason)
+        return self._report

@@ -1,39 +1,139 @@
-from theHarvester.discovery.constants import *
-from theHarvester.lib.core import *
-from theHarvester.parsers import myparser
+import asyncio
+import logging
+
+from theHarvester.discovery.constants import MissingKey
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, Core, FetcherResponse
+from theHarvester.lib.hostnames import normalize_scoped_hostname
+from theHarvester.lib.source_execution import SourceExecutionReport
+
+logger = logging.getLogger(__name__)
 
 
 class SearchHunter:
-
-    def __init__(self, word, limit, start):
+    def __init__(self, word: str, limit: int | None, start: int) -> None:
         self.word = word
-        self.limit = limit
+        self.requested_limit = limit
+        self.limit = min(limit, 10) if limit is not None else 10
         self.start = start
-        self.key = Core.hunter_key()
-        if self.key is None:
+        key = Core.hunter_key()
+        self.key = key.strip() if key else ''
+        if not self.key:
             raise MissingKey('Hunter')
-        self.total_results = ""
-        self.counter = start
-        self.database = f'https://api.hunter.io/v2/domain-search?domain={self.word}&api_key={self.key}&limit={self.limit}'
+        self.total_results = ''
+        self.database = (
+            f'https://api.hunter.io/v2/domain-search?domain={self.word}&api_key={self.key}&limit={self.limit}&offset={self.start}'
+        )
         self.proxy = False
+        self.hostnames: list = []
+        self.emails: list = []
 
-    async def do_search(self):
-        responses = await AsyncFetcher.fetch_all([self.database], headers={'User-Agent': Core.get_user_agent()},
-                                                 proxy=self.proxy)
-        self.total_results += responses[0]
+    async def _fetch_json(self, url: str, headers: dict[str, str], session) -> dict | SourceExecutionReport:
+        response = await AsyncFetcher.fetch_all(
+            [url],
+            headers=headers,
+            session=session,
+            json=True,
+            include_metadata=True,
+        )
+        metadata = response[0] if response and isinstance(response[0], FetcherResponse) else None
+        if metadata is None:
+            logger.info('Hunter request failed without a response')
+            return SourceExecutionReport('failed', 'transport-error')
+        if error := provider_http_error(metadata):
+            logger.info(f'Hunter request failed with HTTP {metadata.status}')
+            return SourceExecutionReport(*error)
+        if not isinstance(metadata.body, dict):
+            logger.info('Hunter returned malformed data')
+            return SourceExecutionReport('failed', 'invalid-response')
+        return metadata.body
 
-    async def process(self, proxy=False):
+    async def do_search(self, session) -> SourceExecutionReport | None:
+        # First determine if a user account is not a free account, this call is free
+        headers = {'User-Agent': Core.get_user_agent()}
+        acc_info_url = f'https://api.hunter.io/v2/account?api_key={self.key}'
+        response = await self._fetch_json(acc_info_url, headers, session)
+        if isinstance(response, SourceExecutionReport):
+            return response
+        is_free = 'plan_name' in response['data'].keys() and response['data']['plan_name'].lower() == 'free'
+        # Extract the total number of requests that are available for an account
+
+        total_requests_avail = (
+            response['data']['requests']['searches']['available'] - response['data']['requests']['searches']['used']
+        )
+        if is_free:
+            response = await self._fetch_json(self.database, headers, session)
+            if isinstance(response, SourceExecutionReport):
+                return response
+            self.emails, self.hostnames = await self.parse_resp(json_resp=response)
+            entries = response.get('data', {}).get('emails', [])
+            if (
+                isinstance(entries, list)
+                and len(entries) >= self.limit
+                and (self.requested_limit is None or self.requested_limit > self.limit)
+            ):
+                return SourceExecutionReport('partial', 'provider-limit')
+        else:
+            # Determine the total number of emails that are available
+            # As the most emails you can get within one query are 100
+            # This is only done where paid accounts are in play
+            hunter_dinfo_url = f'https://api.hunter.io/v2/email-count?domain={self.word}'
+            response = await self._fetch_json(hunter_dinfo_url, headers, session)
+            if isinstance(response, SourceExecutionReport):
+                return response
+            available_results = max(0, response['data']['total'] - self.start)
+            total_results = (
+                min(available_results, self.requested_limit) if self.requested_limit is not None else available_results
+            )
+            total_number_reqs = (total_results + 99) // 100
+            # Parse out meta field within initial JSON response to determine the total number of results
+            quota_exhausted = total_requests_avail < total_number_reqs
+            if quota_exhausted:
+                logger.info('WARNING: account does not have enough requests to gather all emails')
+                logger.info(
+                    f'Total requests available: {total_requests_avail}, total requests needed to be made: {total_number_reqs}'
+                )
+            # max number of emails you can get per request is 100
+            # increments of 100 with offset determining where to start
+            # See docs for more details: https://hunter.io/api-documentation/v2#domain-search
+            result_end = self.start + min(total_results, max(total_requests_avail, 0) * 100)
+            for offset in range(self.start, result_end, 100):
+                page_limit = min(100, result_end - offset)
+                req_url = f'https://api.hunter.io/v2/domain-search?domain={self.word}&api_key={self.key}&limit={page_limit}&offset={offset}'
+                response = await self._fetch_json(req_url, headers, session)
+                if isinstance(response, SourceExecutionReport):
+                    return response
+                temp_emails, temp_hostnames = await self.parse_resp(response)
+                self.emails.extend(temp_emails)
+                self.hostnames.extend(temp_hostnames)
+                await asyncio.sleep(1)
+            if quota_exhausted:
+                return SourceExecutionReport('partial', 'quota-exhausted')
+        return None
+
+    async def parse_resp(self, json_resp: dict) -> tuple[list[str], list[str]]:
+        emails = sorted({email['value'] for email in json_resp['data']['emails']})
+        domains = sorted(
+            {
+                source_domain
+                for email in json_resp['data']['emails']
+                for source in email['sources']
+                if (source_domain := normalize_scoped_hostname(source['domain'], self.word)) is not None
+            }
+        )
+        return emails, domains
+
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
         self.proxy = proxy
-        await self.do_search()  # Only need to do it once.
+        try:
+            async with AsyncFetcher.open_session(proxy=self.proxy, request_timeout=60) as session:
+                return await self.do_search(session)  # Only need to do it once.
+        except AttributeError, KeyError, TypeError:
+            logger.info('Hunter returned malformed data')
+            return SourceExecutionReport('failed', 'invalid-response')
 
-    async def get_emails(self):
-        rawres = myparser.Parser(self.total_results, self.word)
-        return await rawres.emails()
+    async def get_emails(self) -> list[str]:
+        return self.emails
 
-    async def get_hostnames(self):
-        rawres = myparser.Parser(self.total_results, self.word)
-        return await rawres.hostnames()
-
-    async def get_profiles(self):
-        rawres = myparser.Parser(self.total_results, self.word)
-        return await rawres.profiles()
+    async def get_hostnames(self) -> list[str]:
+        return self.hostnames

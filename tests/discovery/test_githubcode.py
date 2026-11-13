@@ -1,99 +1,92 @@
+from unittest.mock import MagicMock
+import pytest
+from httpx import Response
 from theHarvester.discovery import githubcode
 from theHarvester.discovery.constants import MissingKey
-from theHarvester.lib.core import Core
-from unittest.mock import MagicMock
-from requests import Response
-import pytest
+from theHarvester.lib.core import CONFIG_DIRS, Core
 
-pytestmark = pytest.mark.asyncio
+# Captured at collection time: other tests in this package replace Core.github_key without restoring it.
+_GITHUB_KEY_ACCESSOR = Core.__dict__['github_key']
+
+
+@pytest.mark.parametrize('configured_provider', ['GitHub', 'Github'])
+def test_github_code_reads_a_key_configured_under_a_case_variant_provider_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, configured_provider: str
+) -> None:
+    monkeypatch.setattr(Core, 'github_key', _GITHUB_KEY_ACCESSOR)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(Core, 'quiet', True)
+    config_dir = CONFIG_DIRS[0].expanduser()
+    config_dir.mkdir(mode=0o700)
+    (config_dir / 'api-keys.yaml').write_text(
+        f'apikeys:\n  {configured_provider}:\n    key: github-token\n', encoding='utf-8'
+    )
+
+    search = githubcode.SearchGithubCode(word='example.com', limit=10)
+
+    assert search.key == 'github-token'
+    assert search.headers['Authorization'] == 'token github-token'
 
 
 class TestSearchGithubCode:
-
     class OkResponse:
-        response = Response()
-        json = {
-            "items": [
-                {
-                    "text_matches": [
-                        {
-                            "fragment": "test1"
-                        }
-                    ]
-                },
-                {
-                    "text_matches": [
-                        {
-                            "fragment": "test2"
-                        }
-                    ]
-                }
-            ]
-        }
-        response.status_code = 200
-        response.json = MagicMock(return_value=json)
-
-    class FailureResponse:
-        response = Response()
-        response.json = MagicMock(return_value={})
-        response.status_code = 401
-
-    class RetryResponse:
-        response = Response()
-        response.json = MagicMock(return_value={})
-        response.status_code = 403
+        # Mocking the json method properly
+        def __init__(self):
+            self.response = Response(status_code=200)
+            object.__setattr__(
+                self.response,
+                "json",
+                MagicMock(
+                    return_value={
+                        "items": [
+                            {"text_matches": [{"fragment": "test1"}]},
+                            {"text_matches": [{"fragment": "test2"}]},
+                        ]
+                    }
+                ),
+            )
 
     class MalformedResponse:
-        response = Response()
-        json = {
-            "items": [
-                {
-                    "fail": True
-                },
-                {
-                    "text_matches": []
-                },
-                {
-                    "text_matches": [
-                        {
-                            "weird": "result"
-                        }
-                    ]
-                }
-            ]
-        }
-        response.json = MagicMock(return_value=json)
-        response.status_code = 200
+        def __init__(self):
+            self.response = Response(status_code=200)
+            object.__setattr__(
+                self.response,
+                "json",
+                MagicMock(
+                    return_value={
+                        "items": [
+                            {"fail": True},
+                            {"text_matches": []},
+                            {"text_matches": [{"weird": "result"}]},
+                        ]
+                    }
+                ),
+            )
 
+    @pytest.mark.asyncio
     async def test_missing_key(self):
         with pytest.raises(MissingKey):
-            Core.github_key = MagicMock(return_value=None)
+            Core.github_key = MagicMock(return_value=None)  # type: ignore[method-assign]
             githubcode.SearchGithubCode(word="test", limit=500)
 
+    @pytest.mark.asyncio
     async def test_fragments_from_response(self):
-        Core.github_key = MagicMock(return_value="lol")
+        Core.github_key = MagicMock(return_value="test_key")  # type: ignore[method-assign]
         test_class_instance = githubcode.SearchGithubCode(word="test", limit=500)
-        test_result = await test_class_instance.fragments_from_response(self.OkResponse.response.json())
-        print('test_result: ', test_result)
+        test_result = await test_class_instance.fragments_from_response(
+            self.OkResponse().response.json()
+        )
         assert test_result == ["test1", "test2"]
 
+    @pytest.mark.asyncio
     async def test_invalid_fragments_from_response(self):
-        Core.github_key = MagicMock(return_value="lol")
+        Core.github_key = MagicMock(return_value="test_key")  # type: ignore[method-assign]
         test_class_instance = githubcode.SearchGithubCode(word="test", limit=500)
-        test_result = await test_class_instance.fragments_from_response(self.MalformedResponse.response.json())
+        test_result = await test_class_instance.fragments_from_response(
+            self.MalformedResponse().response.json()
+        )
         assert test_result == []
 
-    async def test_next_page(self):
-        Core.github_key = MagicMock(return_value="lol")
-        test_class_instance = githubcode.SearchGithubCode(word="test", limit=500)
-        test_result = githubcode.SuccessResult(list(), next_page=2, last_page=4)
-        assert(2 == await test_class_instance.next_page_or_end(test_result))
 
-    async def test_last_page(self):
-        Core.github_key = MagicMock(return_value="lol")
-        test_class_instance = githubcode.SearchGithubCode(word="test", limit=500)
-        test_result = githubcode.SuccessResult(list(), None, None)
-        assert(None is await test_class_instance.next_page_or_end(test_result))
-
-    if __name__ == '__main__':
-        pytest.main()
+if __name__ == "__main__":
+    pytest.main()

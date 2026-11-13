@@ -1,11 +1,18 @@
-from theHarvester.discovery.constants import *
-from theHarvester.lib.core import *
-from theHarvester.parsers import myparser
-from typing import List, Dict, Any, Optional, NamedTuple, Tuple
 import asyncio
-import aiohttp
+import logging
+import time
 import urllib.parse as urlparse
-import random
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from theHarvester.discovery.constants import MissingKey, get_delay
+from theHarvester.lib.core import AsyncFetcher, Core, ResponseStreamError
+from theHarvester.lib.source_execution import SourceExecutionReport, SourceReportStatus
+from theHarvester.parsers import myparser
+
+if TYPE_CHECKING:
+    import aiohttp
+
+logger = logging.getLogger(__name__)
 
 
 class RetryResult(NamedTuple):
@@ -13,126 +20,232 @@ class RetryResult(NamedTuple):
 
 
 class SuccessResult(NamedTuple):
-    fragments: List[str]
-    next_page: Optional[int]
-    last_page: Optional[int]
+    fragments: list[str]
+    next_page: int
+    last_page: int
 
 
 class ErrorResult(NamedTuple):
     status_code: int
-    body: Any
 
 
 class SearchGithubCode:
+    # GitHub asks clients without a rate-limit deadline to wait at least a minute.
+    DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60.0
+    # Longer deadlines end the source as rate-limited instead of holding the run.
+    MAX_RATE_LIMIT_WAIT_SECONDS = 300.0
 
-    def __init__(self, word, limit):
-        self.word = word
-        self.total_results = ""
-        self.server = 'api.github.com'
-        self.limit = limit
-        self.counter = 0
-        self.page = 1
-        self.key = Core.github_key()
-        # If you don't have a personal access token, github narrows your search capabilities significantly
-        # rate limits you more severely
-        # https://developer.github.com/v3/search/#rate-limit
-        if self.key is None:
-            raise MissingKey('Github')
-        self.proxy = False
+    def __init__(self, word: str, limit: int | None) -> None:
+        try:
+            self.word = word
+            self.total_results = ''
+            self.server = 'api.github.com'
+            self.limit = limit
+            self.counter = 0
+            self.page = 1
+            self.key = Core.github_key()
+            if self.key is None:
+                raise MissingKey('Github')
+            self.proxy = False
+            self.base_url = f'https://{self.server}/search/code?q="{self.word}"'
+            self.headers = {
+                'Host': self.server,
+                'User-agent': Core.get_user_agent(),
+                'Accept': 'application/vnd.github.v3.text-match+json',
+                'Authorization': f'token {self.key}',
+            }
+            # Retry control to avoid infinite loops on rate limiting
+            self.retry_count = 0
+            self.max_retries = 3
+        except Exception as e:
+            logger.info(f'Error initializing SearchGithubCode: {e}')
+            raise
 
     @staticmethod
-    async def fragments_from_response(json_data: dict) -> List[str]:
-        items: List[Dict[str, Any]] = json_data.get('items') or list()
-        fragments: List[str] = list()
+    async def fragments_from_response(json_data: dict) -> list[str]:
+        items = json_data.get('items', [])
+        if not isinstance(items, list):
+            return []
+
+        fragments: list[str] = []
         for item in items:
-            matches = item.get("text_matches") or list()
-            for match in matches:
-                fragments.append(match.get("fragment"))
-
-        return [fragment for fragment in fragments if fragment is not None]
+            if not isinstance(item, dict):
+                continue
+            text_matches = item.get('text_matches', [])
+            if not isinstance(text_matches, list):
+                continue
+            for match in text_matches:
+                if not isinstance(match, dict):
+                    continue
+                fragment = match.get('fragment')
+                if isinstance(fragment, str) and fragment:
+                    fragments.append(fragment)
+        return fragments
 
     @staticmethod
-    async def page_from_response(page: str, links) -> Optional[Any]:
-        page_link = links.get(page)
-        if page_link:
-            parsed = urlparse.urlparse(str(page_link.get("url")))
-            params = urlparse.parse_qs(parsed.query)
-            pages: List[Any] = params.get('page', [None])
-            page_number = pages[0] and int(pages[0])
-            return page_number
-        else:
+    async def page_from_response(page: str, links) -> int | None:
+        try:
+            if page_link := links.get(page):
+                parsed = urlparse.urlparse(str(page_link.get('url')))
+                if page_param := urlparse.parse_qs(parsed.query).get('page', [None])[0]:
+                    return int(page_param)
+            return 0
+        except Exception as e:
+            logger.info(f'Error parsing page response: {e}')
             return None
 
-    async def handle_response(self, response: Tuple[str, dict, int, Any]):
-        text, json_data, status, links = response
-        if status == 200:
-            results = await self.fragments_from_response(json_data)
-            next_page = await self.page_from_response("next", links)
-            last_page = await self.page_from_response("last", links)
-            return SuccessResult(results, next_page, last_page)
-        elif status == 429 or status == 403:
-            return RetryResult(60)
-        else:
-            try:
-                return ErrorResult(status, json_data)
-            except ValueError:
-                return ErrorResult(status, text)
-
-    async def do_search(self, page: Optional[int]) -> Tuple[str, dict, int, Any]:
-        if page is None:
-            url = f'https://{self.server}/search/code?q="{self.word}"'
-        else:
-            url = f'https://{self.server}/search/code?q="{self.word}"&page={page}'
-        headers = {
-            'Host': self.server,
-            'User-agent': Core.get_user_agent(),
-            'Accept': "application/vnd.github.v3.text-match+json",
-            'Authorization': f'token {self.key}'
-        }
-
-        async with aiohttp.ClientSession(headers=headers) as sess:
-            if self.proxy:
-                async with sess.get(url, proxy=random.choice(Core.proxy_list())) as resp:
-                    return await resp.text(), await resp.json(), resp.status, resp.links
-            else:
-                async with sess.get(url) as resp:
-                    return await resp.text(), await resp.json(), resp.status, resp.links
+    async def handle_response(
+        self,
+        response: tuple[str, dict, int, Any, dict[str, str]],
+    ) -> ErrorResult | RetryResult | SuccessResult:
+        try:
+            _text, json_data, status, links, headers = response
+            if status == 200:
+                results = await self.fragments_from_response(json_data)
+                # Ensure next_page and last_page default to 0 if None
+                next_page = await self.page_from_response('next', links) or 0
+                last_page = await self.page_from_response('last', links) or 0
+                return SuccessResult(results, next_page, last_page)
+            if status == 429 or self._is_rate_limited(status, headers):
+                return RetryResult(self._rate_limit_wait(headers))
+            return ErrorResult(status)
+        except Exception as e:
+            logger.info(f'Error handling response: {e}')
+            return ErrorResult(500)
 
     @staticmethod
-    async def next_page_or_end(result: SuccessResult) -> Optional[int]:
-        if result.next_page is not None:
-            return result.next_page
-        else:
-            return result.last_page
+    def _is_rate_limited(status: int, headers: dict[str, str]) -> bool:
+        # GitHub reports primary and secondary rate limits as 403 with these headers.
+        return status == 403 and (headers.get('x-ratelimit-remaining') == '0' or 'retry-after' in headers)
 
-    async def process(self, proxy=False):
-        self.proxy = proxy
+    @classmethod
+    def _rate_limit_wait(cls, headers: dict[str, str]) -> float:
+        """Return the seconds GitHub requires before the next request."""
+        # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#exceeding-the-rate-limit
+        deadlines: list[float] = []
         try:
-            while self.counter <= self.limit and self.page is not None:
-                api_response = await self.do_search(self.page)
-                result = await self.handle_response(api_response)
-                if isinstance(result, SuccessResult):
-                    print(f'\tSearching {self.counter} results.')
-                    for fragment in result.fragments:
-                        self.total_results += fragment
-                        self.counter = self.counter + 1
-                    self.page = await self.next_page_or_end(result)
-                    await asyncio.sleep(get_delay())
-                elif isinstance(result, RetryResult):
-                    sleepy_time = get_delay() + result.time
-                    print(f'\tRetrying page in {sleepy_time} seconds...')
-                    await asyncio.sleep(sleepy_time)
-                elif isinstance(result, ErrorResult):
-                    raise Exception(f"\tException occurred: status_code: {result.status_code} reason: {result.body}")
-                else:
-                    raise Exception("\tUnknown exception occurred")
+            deadlines.append(float(headers['retry-after']))
+        except KeyError, ValueError:
+            pass
+        if headers.get('x-ratelimit-remaining') == '0':
+            try:
+                deadlines.append(float(headers['x-ratelimit-reset']) - time.time())
+            except KeyError, ValueError:
+                pass
+        if not deadlines:
+            return cls.DEFAULT_RATE_LIMIT_WAIT_SECONDS
+        return max(0.0, *deadlines)
+
+    async def do_search(
+        self,
+        page: int,
+        session: aiohttp.ClientSession | None = None,
+    ) -> tuple[str, dict, int, Any, dict[str, str]]:
+        try:
+            if session is None:
+                async with AsyncFetcher.open_session(headers=self.headers, proxy=self.proxy) as owned_session:
+                    return await self.do_search(page, owned_session)
+            url = f'{self.base_url}&page={page}' if page else self.base_url
+            response = await AsyncFetcher.fetch_json(url, session=session)
+            body = response.body if isinstance(response.body, dict) else {}
+            return '', body, response.status, response.links, response.headers
+        except ResponseStreamError:
+            raise
         except Exception as e:
-            print(f'An exception has occurred: {e}')
+            logger.info(f'Error performing search: {e}')
+            return '', {}, 500, {}, {}
+
+    def _failure_report(self, reason: str, *, empty_status: SourceReportStatus = 'failed') -> SourceExecutionReport:
+        status = 'partial' if self.counter else empty_status
+        return SourceExecutionReport(status, reason)
+
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
+        try:
+            self.proxy = proxy
+            visited_pages: set[int] = set()
+            seen_page_content: set[tuple[str, ...]] = set()
+            async with AsyncFetcher.open_session(headers=self.headers, proxy=self.proxy) as session:
+                while (self.limit is None or self.counter < self.limit) and self.page != 0:
+                    try:
+                        visited_pages.add(self.page)
+                        api_response = await self.do_search(self.page, session)
+                        result = await self.handle_response(api_response)
+
+                        if isinstance(result, SuccessResult):
+                            if self.limit is None and result.fragments:
+                                page_content = tuple(sorted(result.fragments))
+                                if page_content in seen_page_content:
+                                    logger.info('\tRepeated result page detected; exiting to avoid infinite loop.')
+                                    self.page = 0
+                                    return self._failure_report('repeated-page')
+                                seen_page_content.add(page_content)
+                            # Reset retry counter on any successful response
+                            self.retry_count = 0
+                            logger.info(f'\tSearching {self.counter} results.')
+                            remaining = self.limit - self.counter if self.limit is not None else len(result.fragments)
+                            fragments = result.fragments[:remaining]
+                            if not fragments:
+                                self.page = 0
+                                break
+                            self.total_results += f'{" ".join(fragments)} '
+                            self.counter += len(fragments)
+                            if self.limit is not None and self.counter >= self.limit:
+                                self.page = 0
+                                break
+                            next_or_last = result.next_page or result.last_page
+                            if next_or_last in visited_pages:
+                                logger.info('\tPagination cycle detected; exiting to avoid infinite loop.')
+                                self.page = 0
+                                return self._failure_report('repeated-page')
+                            self.page = next_or_last
+                            await asyncio.sleep(get_delay())
+                        elif isinstance(result, RetryResult):
+                            self.retry_count += 1
+                            if self.retry_count > self.max_retries:
+                                logger.info('\tMaximum retries reached; exiting to avoid infinite loop.')
+                                self.page = 0
+                                return self._failure_report('rate-limited', empty_status='rate-limited')
+                            if result.time > self.MAX_RATE_LIMIT_WAIT_SECONDS:
+                                logger.info(f'\tGitHub rate limit resets in {result.time:.0f} seconds; stopping.')
+                                self.page = 0
+                                return self._failure_report('rate-limited', empty_status='rate-limited')
+                            sleepy_time = get_delay() + result.time
+                            logger.info(f'\tRetrying page in {sleepy_time} seconds...')
+                            await asyncio.sleep(sleepy_time)
+                        else:
+                            # On error, stop to avoid endless retries on a bad state
+                            logger.info(f'\tGitHub code API request failed with status {result.status_code}')
+                            self.page = 0
+                            reason = 'access-denied' if result.status_code in {401, 403} else 'provider-error'
+                            return self._failure_report(reason)
+                    except ResponseStreamError as e:
+                        logger.info(f'Error processing page: {e}')
+                        self.page = 0
+                        return self._failure_report(e.reason)
+                    except Exception as e:
+                        logger.info(f'Error processing page: {e}')
+                        self.retry_count += 1
+                        if self.retry_count > self.max_retries:
+                            self.page = 0
+                            return self._failure_report('transport-error')
+                        await asyncio.sleep(get_delay())
+        except Exception as e:
+            logger.info(f'An exception has occurred in githubcode process: {e}')
+            return self._failure_report('transport-error')
+        return None
 
     async def get_emails(self):
-        rawres = myparser.Parser(self.total_results, self.word)
-        return await rawres.emails()
+        try:
+            rawres = myparser.Parser(self.total_results, self.word)
+            return await rawres.emails()
+        except Exception as e:
+            logger.info(f'Error getting emails: {e}')
+            return []
 
     async def get_hostnames(self):
-        rawres = myparser.Parser(self.total_results, self.word)
-        return await rawres.hostnames()
+        try:
+            rawres = myparser.Parser(self.total_results, self.word)
+            return await rawres.hostnames()
+        except Exception as e:
+            logger.info(f'Error getting hostnames: {e}')
+            return []

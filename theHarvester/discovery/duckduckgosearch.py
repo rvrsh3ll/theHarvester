@@ -1,76 +1,117 @@
-from theHarvester.discovery.constants import *
-from theHarvester.lib.core import *
+from typing import Any
+from urllib.parse import urlencode
+
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, Core, ResponseStreamError
+from theHarvester.lib.source_execution import SourceExecutionReport
 from theHarvester.parsers import myparser
-import json
+
+_TEXT_FIELDS = (
+    'Abstract',
+    'AbstractSource',
+    'AbstractText',
+    'AbstractURL',
+    'Answer',
+    'AnswerType',
+    'Definition',
+    'DefinitionSource',
+    'DefinitionURL',
+    'Entity',
+    'Heading',
+    'Image',
+    'Redirect',
+    'Type',
+)
+_TOPIC_TEXT_FIELDS = ('FirstURL', 'Name', 'Result', 'Text')
+
+
+def _topic_text(items: object) -> list[str] | None:
+    if not isinstance(items, list):
+        return None
+    text: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        recognized = False
+        for field in _TOPIC_TEXT_FIELDS:
+            if field not in item:
+                continue
+            recognized = True
+            value = item[field]
+            if not isinstance(value, str):
+                return None
+            text.append(value)
+        if 'Topics' in item:
+            recognized = True
+            nested = _topic_text(item['Topics'])
+            if nested is None:
+                return None
+            text.extend(nested)
+        if item and not recognized:
+            return None
+    return text
+
+
+def _provider_text(body: dict[str, Any]) -> str | None:
+    if not body:
+        return ''
+    recognized = False
+    text: list[str] = []
+    for field in _TEXT_FIELDS:
+        if field not in body:
+            continue
+        recognized = True
+        value = body[field]
+        if not isinstance(value, str):
+            return None
+        text.append(value)
+    for field in ('RelatedTopics', 'Results'):
+        if field not in body:
+            continue
+        recognized = True
+        topic_text = _topic_text(body[field])
+        if topic_text is None:
+            return None
+        text.extend(topic_text)
+    if not recognized:
+        return None
+    return '\n'.join(text)
 
 
 class SearchDuckDuckGo:
-
-    def __init__(self, word, limit):
+    def __init__(self, word: str, limit: int | None) -> None:
         self.word = word
-        self.results = ""
-        self.totalresults = ""
-        self.dorks = []
-        self.links = []
-        self.database = 'https://duckduckgo.com/?q='
-        self.api = 'https://api.duckduckgo.com/?q=x&format=json&pretty=1'  # Currently using API.
-        self.quantity = '100'
+        self.results = ''
+        self.totalresults = ''
+        self.api = 'https://api.duckduckgo.com/'
         self.limit = limit
-        self.proxy = False
+        self.proxy: bool = False
 
-    async def do_search(self):
-        # Do normal scraping.
-        url = self.api.replace('x', self.word)
-        headers = {'User-Agent': googleUA}
-        first_resp = await AsyncFetcher.fetch_all([url], headers=headers, proxy=self.proxy)
-        self.results = first_resp[0]
-        self.totalresults += self.results
-        urls = await self.crawl(self.results)
-        urls = {url for url in urls if len(url) > 5}
-        all_resps = await AsyncFetcher.fetch_all(urls)
-        self.totalresults += ''.join(all_resps)
-
-    async def crawl(self, text):
-        """
-        Function parses json and returns URLs.
-        :param text: formatted json
-        :return: set of URLs
-        """
-        urls = set()
+    async def do_search(self) -> SourceExecutionReport | None:
+        # Query only the provider; URLs in the response are evidence, not crawl targets.
+        url = f'{self.api}?{urlencode({"q": self.word, "format": "json", "pretty": 1})}'
+        headers = {'User-Agent': Core.get_user_agent()}
         try:
-            load = json.loads(text)
-            for keys in load.keys():  # Iterate through keys of dict.
-                val = load.get(keys)
-                if isinstance(val, int) or isinstance(val, dict) or val is None:
-                    continue
-                if isinstance(val, list):
-                    if len(val) == 0:  # Make sure not indexing an empty list.
-                        continue
-                    val = val[0]  # First value should be dict.
-                    if isinstance(val, dict):  # Sanity check.
-                        for key in val.keys():
-                            value = val.get(key)
-                            if isinstance(value, str) and value != '' and 'https://' in value or 'http://' in value:
-                                urls.add(value)
-                if isinstance(val, str) and val != '' and 'https://' in val or 'http://' in val:
-                    urls.add(val)
-            tmp = set()
-            for url in urls:
-                if '<' in url and 'href=' in url:  # Format is <href="https://www.website.com"/>
-                    equal_index = url.index('=')
-                    true_url = ''
-                    for ch in url[equal_index + 1:]:
-                        if ch == '"':
-                            tmp.add(true_url)
-                            break
-                        true_url += ch
-                else:
-                    if url != '':
-                        tmp.add(url)
-            return tmp
-        except Exception as e:
-            print(f'Exception occurred: {e}')
-            return []
+            response = await AsyncFetcher.fetch_json(url, headers=headers, proxy=self.proxy)
+        except ResponseStreamError as error:
+            return SourceExecutionReport('failed', error.reason)
+        if failure := provider_http_error(response):
+            return SourceExecutionReport(*failure)
+        if not isinstance(response.body, dict):
+            return SourceExecutionReport('failed', 'invalid-response')
+        if 'error' in response.body:
+            provider_error = str(response.body['error']).lower()
+            if 'rate limit' in provider_error:
+                return SourceExecutionReport('rate-limited', 'provider-rate-limit')
+            if 'access denied' in provider_error or 'forbidden' in provider_error:
+                return SourceExecutionReport('failed', 'access-denied')
+            return SourceExecutionReport('failed', 'provider-error')
+        provider_text = _provider_text(response.body)
+        if provider_text is None:
+            return SourceExecutionReport('failed', 'invalid-response')
+        self.results = provider_text
+        self.totalresults += self.results
+        return None
 
     async def get_emails(self):
         rawres = myparser.Parser(self.totalresults, self.word)
@@ -80,6 +121,6 @@ class SearchDuckDuckGo:
         rawres = myparser.Parser(self.totalresults, self.word)
         return await rawres.hostnames()
 
-    async def process(self, proxy=False):
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
         self.proxy = proxy
-        await self.do_search()  # Only need to search once since using API.
+        return await self.do_search()  # Only need to search once since using API.

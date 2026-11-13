@@ -1,34 +1,393 @@
 #!/usr/bin/env python3
-# coding=utf-8
-from theHarvester.lib.core import *
-from theHarvester.discovery import certspottersearch
-import requests
+import logging
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import httpx
 import pytest
 
-pytestmark = pytest.mark.asyncio
+from theHarvester.discovery import certspottersearch
+from theHarvester.lib.core import Core, FetcherResponse
+from theHarvester.lib.source_execution import SourceExecutionReport
 
 
-class TestCertspotter(object):
+def certspotter_response(payload: object) -> list[FetcherResponse]:
+    return [FetcherResponse(payload, 200, {})]
+
+
+class TestCertspotter:
     @staticmethod
     def domain() -> str:
-        return 'metasploit.com'
+        return 'example.com'
 
-    async def test_api(self):
-        base_url = f'https://api.certspotter.com/v1/issuances?domain={TestCertspotter.domain()}&expand=dns_names'
+
+class TestCertspotterSearch:
+    @pytest.mark.live_network
+    def test_api(self, live_test_domain: str) -> None:
+        base_url = f'https://api.certspotter.com/v1/issuances?domain={live_test_domain}&expand=dns_names'
         headers = {'User-Agent': Core.get_user_agent()}
-        request = requests.get(base_url, headers=headers)
+        request = httpx.get(base_url, headers=headers, timeout=30)
         assert request.status_code == 200
+        payload = request.json()
+        assert isinstance(payload, list)
+        assert all(isinstance(item, dict) for item in payload)
 
-    async def test_search(self):
+    @pytest.mark.asyncio
+    async def test_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            return certspotter_response([{'dns_names': ['api.example.com', 'www.example.com']}])
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
         search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
-        await search.process()
-        assert isinstance(await search.get_hostnames(), set)
+        report = await search.process()
+        assert report is not None
+        assert report.status == 'partial'
+        assert report.stop_reason == 'invalid-cursor'
+        assert await search.get_hostnames() == {'api.example.com', 'www.example.com'}
 
-    async def test_search_no_results(self):
-        search = certspottersearch.SearchCertspoter('radiant.eu')
-        await search.process()
-        assert len(await search.get_hostnames()) == 0
+    @pytest.mark.asyncio
+    async def test_search_collects_all_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pages = [
+            [{'id': '1', 'dns_names': ['first.example.com']}],
+            [{'id': '2', 'dns_names': ['second.example.com']}],
+            [],
+        ]
+        requested_urls: list[str] = []
+
+        async def fake_fetch_all(urls: list[str], **_kwargs: Any) -> list[FetcherResponse]:
+            requested_urls.extend(urls)
+            return certspotter_response(pages.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        report = await search.process()
+
+        assert report is None
+        assert await search.get_hostnames() == {'first.example.com', 'second.example.com'}
+        assert [parse_qs(urlparse(url).query) for url in requested_urls] == [
+            {'domain': ['example.com'], 'include_subdomains': ['true'], 'expand': ['dns_names']},
+            {
+                'domain': ['example.com'],
+                'include_subdomains': ['true'],
+                'expand': ['dns_names'],
+                'after': ['1'],
+            },
+            {
+                'domain': ['example.com'],
+                'include_subdomains': ['true'],
+                'expand': ['dns_names'],
+                'after': ['2'],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_search_continues_until_provider_exhaustion_without_a_page_cap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        requests = 0
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            nonlocal requests
+            requests += 1
+            if requests > 3:
+                return certspotter_response([])
+            return certspotter_response([{'id': f'cursor-{requests}', 'dns_names': [f'host-{requests}.example.com']}])
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert requests == 4
+        assert await search.get_hostnames() == {
+            'host-1.example.com',
+            'host-2.example.com',
+            'host-3.example.com',
+        }
+        assert report is None
+        assert 'page limit reached' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_search_returns_only_normalized_scoped_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pages = [
+            [
+                {
+                    'id': '1',
+                    'dns_names': [
+                        'WWW.Example.COM.',
+                        '*.api.example.com',
+                        'example.com',
+                        'outside.test',
+                        'not example.com',
+                        '.example.com',
+                        'bad..example.com',
+                        '-bad.example.com',
+                        None,
+                    ],
+                }
+            ],
+            [],
+        ]
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            return certspotter_response(pages.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(' Example.COM. ')
+        report = await search.process()
+
+        assert report is not None
+        assert report.status == 'partial'
+        assert report.stop_reason == 'malformed-issuance'
+        assert await search.get_hostnames() == {'api.example.com', 'example.com', 'www.example.com'}
+
+    @pytest.mark.asyncio
+    async def test_search_preserves_results_when_rate_limited(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        responses: list[Any] = [
+            [{'id': '1', 'dns_names': ['first.example.com']}],
+            {'code': 'rate_limited', 'message': 'provider details must not be logged'},
+        ]
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            return certspotter_response(responses.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com'}
+        assert report.status == 'rate-limited'
+        assert report.stop_reason == 'rate_limited'
+        assert 'rate_limited' in caplog.text
+        assert 'results may be incomplete' in caplog.text
+        assert 'provider details must not be logged' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_search_preserves_results_when_transport_fails(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        responses: list[Any] = [
+            [{'id': '1', 'dns_names': ['first.example.com']}],
+            None,
+        ]
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[Any]:
+            response = responses.pop(0)
+            return [response] if response is None else certspotter_response(response)
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com'}
+        assert report.status == 'partial'
+        assert report.stop_reason == 'transport-error'
+        assert 'results may be incomplete' in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('response', 'stop_reason'),
+        [
+            ([], 'no-response'),
+            ([FetcherResponse('not a list', 200, {})], 'invalid-response'),
+            ([None], 'transport-error'),
+        ],
+    )
+    async def test_search_reports_first_page_failure_as_failed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        response: list[Any],
+        stop_reason: str,
+    ) -> None:
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[Any]:
+            return response
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == set()
+        assert report.status == 'failed'
+        assert report.stop_reason == stop_reason
+        assert 'results may be incomplete' in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('status', 'expected_report'),
+        [
+            (403, SourceExecutionReport('failed', 'access-denied')),
+            (429, SourceExecutionReport('rate-limited', 'http-429')),
+            (500, SourceExecutionReport('failed', 'http-500')),
+        ],
+    )
+    async def test_search_reports_http_failures(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        status: int,
+        expected_report: SourceExecutionReport,
+    ) -> None:
+        async def fake_fetch_all(*_args: Any, **kwargs: Any) -> list[FetcherResponse]:
+            assert kwargs['include_metadata'] is True
+            return [FetcherResponse('provider detail', status, {})]
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == set()
+        assert report == expected_report
+        assert 'results may be incomplete' in caplog.text
+        assert 'provider detail' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_search_reports_malformed_issuance_as_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pages = [
+            [None, {'id': '1', 'dns_names': ['first.example.com']}],
+            [],
+        ]
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            return certspotter_response(pages.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com'}
+        assert report.status == 'partial'
+        assert report.stop_reason == 'malformed-issuance'
+        assert 'results may be incomplete' in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('error', 'stop_reason'),
+        [
+            (ConnectionError('private connection details'), 'connection-error'),
+            (RuntimeError('private provider payload'), 'unexpected-error'),
+        ],
+    )
+    async def test_search_redacts_unexpected_errors(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error: Exception,
+        stop_reason: str,
+    ) -> None:
+        responses: list[Any] = [
+            [{'id': '1', 'dns_names': ['first.example.com']}],
+            error,
+        ]
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse] | Any:
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return certspotter_response(response)
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com'}
+        assert report.status == 'partial'
+        assert report.stop_reason == stop_reason
+        assert 'results may be incomplete' in caplog.text
+        assert str(error) not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_search_stops_on_repeated_cursor(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pages = [
+            [{'id': 'repeated', 'dns_names': ['first.example.com']}],
+            [{'id': 'repeated', 'dns_names': ['second.example.com']}],
+        ]
+        calls = 0
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            nonlocal calls
+            calls += 1
+            return certspotter_response(pages.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com', 'second.example.com'}
+        assert calls == 2
+        assert report.status == 'partial'
+        assert report.stop_reason == 'repeated-cursor'
+        assert 'results may be incomplete' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_search_continues_until_empty_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pages = [[{'id': str(page_number), 'dns_names': [f'page-{page_number}.example.com']}] for page_number in range(1, 12)]
+        pages.append([])
+        calls = 0
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            nonlocal calls
+            calls += 1
+            return certspotter_response(pages.pop(0))
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        report = await search.process()
+
+        assert report is None
+        assert await search.get_hostnames() == {f'page-{page_number}.example.com' for page_number in range(1, 12)}
+        assert calls == 12
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'issuance',
+        [
+            {'dns_names': ['first.example.com']},
+            {'id': '   ', 'dns_names': ['first.example.com']},
+        ],
+    )
+    async def test_search_reports_invalid_cursor_as_incomplete(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        issuance: dict[str, Any],
+    ) -> None:
+        calls = 0
+
+        async def fake_fetch_all(*_args: Any, **_kwargs: Any) -> list[FetcherResponse]:
+            nonlocal calls
+            calls += 1
+            return certspotter_response([issuance])
+
+        monkeypatch.setattr(certspottersearch.AsyncFetcher, 'fetch_all', fake_fetch_all)
+        search = certspottersearch.SearchCertspoter(TestCertspotter.domain())
+        with caplog.at_level(logging.WARNING, logger=certspottersearch.__name__):
+            report = await search.process()
+
+        assert await search.get_hostnames() == {'first.example.com'}
+        assert calls == 1
+        assert report.status == 'partial'
+        assert report.stop_reason == 'invalid-cursor'
+        assert 'results may be incomplete' in caplog.text
 
 
 if __name__ == '__main__':
     pytest.main()
+
+
+pytestmark = pytest.mark.provider_contract('certspotter')

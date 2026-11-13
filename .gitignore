@@ -2,9 +2,14 @@
 *.pyc
 *.sqlite
 *.html
+!docs/images/harvestview-architecture.html
+!docs/images/run-evidence-architecture.html
+!theHarvester/lib/api/static/harvestview/index.html
+!theHarvester/lib/api/static/harvestview/schedules.html
 *.htm
 *.vscode
 *.xml
+*.json
 debug_results.txt
 venv
 .mypy_cache
@@ -14,4 +19,40 @@ dist/
 theHarvester.egg-info
 api-keys.yaml
 .DS_Store
-api-keys.yaml
+.venv
+.venv/**
+.pyre
+.junie
+.env
+.env.*
+.secrets/
+test-results/
+/testdata/
+
+# impeccable-ignore-start
+# Ephemeral output, runtime state, and per-dev overrides.
+# Unanchored: .impeccable may sit at the repo root or under a nested
+# workspace (apps/web/.impeccable/...); anchored patterns would miss it.
+# Shared artifacts stay tracked: config.json, live/config.json, design.json.
+**/.impeccable/config.local.json
+**/.impeccable/hook.cache.json
+**/.impeccable/hook.pending.json
+**/.impeccable/*.png
+**/.impeccable/critique/
+**/.impeccable/live/server.json
+**/.impeccable/live/sessions/
+**/.impeccable/live/previews/
+**/.impeccable/live/annotations/
+**/.impeccable/live/cache/
+**/.impeccable/live/manual-edit-apply-transaction.json
+**/.impeccable/live/manual-edit-events.jsonl
+**/.impeccable/live/manual-edit-evidence/
+**/.impeccable/live/pending-manual-edits.json
+**/.impeccable/live/deferred-svelte-component-accepts.json
+**/.impeccable/live/*.png
+# impeccable-ignore-end
+
+# Shared Impeccable artifacts override the repository-wide *.json rule.
+!**/.impeccable/config.json
+!**/.impeccable/live/config.json
+!**/.impeccable/design.json

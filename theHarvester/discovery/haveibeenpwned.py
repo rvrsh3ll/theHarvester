@@ -1,0 +1,83 @@
+import logging
+
+from theHarvester.lib.core import AsyncFetcher, Core, FetcherResponse
+from theHarvester.lib.source_execution import SourceExecutionReport
+
+logger = logging.getLogger(__name__)
+
+
+class SearchHaveIBeenPwned:
+    def __init__(self, word: str):
+        self.word = word
+        self.base_url = 'https://haveibeenpwned.com/api/v3'
+        self.headers = {'User-Agent': Core.get_user_agent(), 'Content-Type': 'application/json'}
+        self.hosts: set[str] = set()
+        self.breaches: list[dict] = []
+        self.breach_names: set[str] = set()
+        self.breach_dates: set[str] = set()
+        self.breach_types: set[str] = set()
+        self.affected_data: set[str] = set()
+
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
+        """Search for breaches associated with a domain or email."""
+        try:
+            responses = await AsyncFetcher.fetch_all(
+                [f'{self.base_url}/breaches?domain={self.word}'],
+                headers=self.headers,
+                json=True,
+                proxy=proxy,
+                include_metadata=True,
+            )
+        except OSError, RuntimeError, ValueError:
+            logger.info('HaveIBeenPwned request failed')
+            return SourceExecutionReport('failed', 'transport-error')
+
+        response = responses[0] if responses and isinstance(responses[0], FetcherResponse) else None
+        if response is None:
+            logger.info('HaveIBeenPwned request failed')
+            return SourceExecutionReport('failed', 'transport-error')
+        if response.status == 429:
+            logger.info('HaveIBeenPwned request failed with HTTP 429')
+            return SourceExecutionReport('rate-limited', 'http-429')
+        if not 200 <= response.status < 300:
+            logger.info(f'HaveIBeenPwned request failed with HTTP {response.status}')
+            return SourceExecutionReport('failed', f'http-{response.status}')
+        if not isinstance(response.body, list) or not all(isinstance(breach, dict) for breach in response.body):
+            logger.info('HaveIBeenPwned returned malformed breach data')
+            return SourceExecutionReport('failed', 'invalid-response')
+
+        self.breaches = response.body
+        self._extract_data()
+        return None
+
+    def _extract_data(self) -> None:
+        """Extract and categorize breach information."""
+        for breach in self.breaches:
+            if isinstance(name := breach.get('Name'), str) and name.strip():
+                self.breach_names.add(name.strip())
+            if isinstance(domain := breach.get('Domain'), str):
+                self.hosts.add(domain)
+            if isinstance(breach_date := breach.get('BreachDate'), str):
+                self.breach_dates.add(breach_date)
+            if isinstance(breach_type := breach.get('BreachType'), str):
+                self.breach_types.add(breach_type)
+            if isinstance(data_classes := breach.get('DataClasses'), list):
+                self.affected_data.update(item for item in data_classes if isinstance(item, str))
+
+    async def get_hostnames(self) -> set[str]:
+        return self.hosts
+
+    async def get_breaches(self) -> list[dict]:
+        return self.breaches
+
+    async def get_breach_names(self) -> set[str]:
+        return self.breach_names
+
+    async def get_breach_dates(self) -> set[str]:
+        return self.breach_dates
+
+    async def get_breach_types(self) -> set[str]:
+        return self.breach_types
+
+    async def get_affected_data(self) -> set[str]:
+        return self.affected_data
